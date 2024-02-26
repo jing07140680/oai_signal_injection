@@ -1,0 +1,551 @@
+diff --git a/executables/nr-ue.c b/executables/nr-ue.c
+index 5860d7c64d..f09d9b408d 100644
+--- a/executables/nr-ue.c
++++ b/executables/nr-ue.c
+@@ -96,6 +96,76 @@
+ #define RX_JOB_ID 0x1010
+ #define TX_JOB_ID 100
+ 
++#define NUM_THREADS 4
++
++pthread_mutex_t task_mutex = PTHREAD_MUTEX_INITIALIZER;
++pthread_cond_t task_condition = PTHREAD_COND_INITIALIZER;
++
++
++typedef struct {
++    int16_t* data;
++} Task;
++
++Task* task_queue = NULL;
++int task_count = 0;
++int task_capacity = 0;
++
++void initialize_task_queue(int capacity) {
++    task_queue = (Task*)malloc(capacity * sizeof(Task));
++    if (task_queue == NULL) {
++        perror("Error allocating memory for task_queue");
++        exit(EXIT_FAILURE);
++    }
++    task_capacity = capacity;
++}
++
++void* work_thread(void* arg) {
++    while (1) {
++        Task current_task;
++
++        // Lock the mutex and check for tasks
++        pthread_mutex_lock(&task_mutex);
++
++        while (task_count == 0) {
++            // Wait for a task to become available
++            pthread_cond_wait(&task_condition, &task_mutex);
++        }
++
++        // Get the next task from the queue
++        current_task = task_queue[0];
++
++        // Shift the remaining tasks in the queue
++        for (int i = 0; i < task_count - 1; i++) {
++            task_queue[i] = task_queue[i + 1];
++        }
++
++        task_count--;
++
++        pthread_mutex_unlock(&task_mutex);
++
++        // Check if the task is a termination signal
++        if (current_task.data == NULL) {
++            break;
++        }
++
++        // Write the data to the file
++        FILE* file = fopen("complex.txt", "a+");
++        if (file != NULL) {
++	  int16_t *ptr = current_task.data;
++	  //ptr += 22940;
++	  //for (int i = 0; i < 100; i++) {
++	  int16_t real = ptr[0];
++	  int16_t imag = ptr[1];
++	  // Write the complex number to the file in "real + imag j" format
++	  fprintf(file, "%d+%dj\n", real, imag);
++	  fclose(file);
++        }
++        free(current_task.data);
++    }
++
++    return NULL;
++}
++
+ typedef enum {
+   pss = 0,
+   pbch = 1,
+@@ -1005,11 +1075,23 @@ void init_NR_UE(int nb_inst,
+ 
+ void init_NR_UE_threads(int nb_inst) {
+   int inst;
++  
+ 
+   pthread_t threads[nb_inst];
+ 
+   for (inst=0; inst < nb_inst; inst++) {
+     PHY_VARS_NR_UE *UE = PHY_vars_UE_g[inst][0];
++    initialize_task_queue(100);
++
++    pthread_t work_threads[4]; // Create 4 consumer threads in this example
++    // Create consumer threads as detached
++    pthread_attr_t attr;
++    pthread_attr_init(&attr);
++    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++
++    for (int i = 0; i < 4; i++) {
++        pthread_create(&work_threads[i], &attr, work_thread, NULL);
++    }
+ 
+     LOG_I(PHY,"Intializing UE Threads for instance %d (%p,%p)...\n",inst,PHY_vars_UE_g[inst],PHY_vars_UE_g[inst][0]);
+     threadCreate(&threads[inst], UE_thread, (void *)UE, "UEthread", -1, OAI_PRIORITY_RT_MAX);
+diff --git a/executables/softmodem-common.h b/executables/softmodem-common.h
+index b8f7e6ff62..5862e81d3c 100644
+--- a/executables/softmodem-common.h
++++ b/executables/softmodem-common.h
+@@ -356,3 +356,4 @@ extern int16_t vnf_pnf_sfnslot_delta;
+ }
+ #endif
+ #endif
++
+diff --git a/openair1/PHY/MODULATION/modulation_UE.h b/openair1/PHY/MODULATION/modulation_UE.h
+index 420cf07e3d..c8833c0ae8 100644
+--- a/openair1/PHY/MODULATION/modulation_UE.h
++++ b/openair1/PHY/MODULATION/modulation_UE.h
+@@ -90,3 +90,10 @@ int compute_BF_weights(int32_t **beam_weights, int32_t **calib_dl_ch_estimates,
+ 
+ /** @}*/
+ #endif
++
++#ifndef MUTEX_H
++#define MUTEX_H
++#include <pthread.h>
++extern pthread_mutex_t task_mutex;
++extern pthread_cond_t task_condition;
++#endif
+diff --git a/openair1/PHY/MODULATION/slot_fep_nr.c b/openair1/PHY/MODULATION/slot_fep_nr.c
+index dee8253388..ebcfc461a7 100644
+--- a/openair1/PHY/MODULATION/slot_fep_nr.c
++++ b/openair1/PHY/MODULATION/slot_fep_nr.c
+@@ -26,6 +26,9 @@
+ #include "PHY/LTE_ESTIMATION/lte_estimation.h"
+ #include "PHY/NR_UE_ESTIMATION/nr_estimation.h"
+ #include <common/utils/LOG/log.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <pthread.h>
+ 
+ //#define DEBUG_FEP
+ 
+@@ -33,6 +36,86 @@
+ #undef LOG_I
+ #define LOG_I(A,B...) printf(A)
+ #endif*/
++#define NUM_THREADS 4
++
++// Define a structure to hold the arguments
++struct ThreadArgs {
++  int16_t *ptr;
++  int Ns;
++};
++
++typedef struct {
++    char* data;
++} Task;
++
++
++extern Task* task_queue;
++extern int task_capacity;
++extern int task_count;
++//extern pthread_mutex_t task_mutex;
++//extern pthread_cond_t task_condition;
++
++void resize_task_queue() {
++    int new_capacity = task_capacity * 2;
++    task_queue = (Task*)realloc(task_queue, new_capacity * sizeof(Task));
++    if (task_queue == NULL) {
++        perror("Error reallocating memory for task_queue");
++        exit(EXIT_FAILURE);
++    }
++    task_capacity = new_capacity;
++}
++
++
++int16_t* generate_data(){
++  return 1000;
++}
++
++/*
++// Define a function that contains your code
++void* write_complex_numbers(void* arg) {
++  struct ThreadArgs *args = (struct ThreadArgs*)arg;
++  FILE *file;
++  if (args->Ns == 1){
++    pthread_mutex_lock(&file_access_mutex);
++    file = fopen("complex_numbers_1.txt", "a+");
++    if (file == NULL) {
++      perror("Error opening file");
++      pthread_exit(NULL);  // Exit the thread on error
++    }
++    int16_t *ptr = args->ptr;
++    ptr += 22940;
++    for (int i = 0; i < 100; i++) {
++      int16_t real = ptr[0];
++      int16_t imag = ptr[1];
++      // Write the complex number to the file in "real + imag j" format
++      fprintf(file, "%d+%dj\n", real, imag);
++      ptr += 1;
++    }
++    fclose(file);
++    pthread_mutex_unlock(&file_access_mutex);
++    
++    return NULL;
++  }
++ 
++  if (args->Ns == 2){
++    file = fopen("complex_numbers_1.txt", "a+");
++    if (file == NULL) {
++      perror("Error opening file");
++      pthread_exit(NULL);  // Exit the thread on error
++    }
++    int16_t *ptr = args->ptr;
++    //ptr += 22940;
++    for (int i = 0; i < 100; i++) {
++      int16_t real = ptr[0];
++      int16_t imag = ptr[1];
++      // Write the complex number to the file in "real + imag j" format
++      fprintf(file, "%d+%dj\n", real, imag);
++      ptr += 1;
++    }
++    fclose(file);
++  }
++}
++*/
+ 
+ int nr_slot_fep(PHY_VARS_NR_UE *ue,
+                 UE_nr_rxtx_proc_t *proc,
+@@ -54,52 +137,107 @@ int nr_slot_fep(PHY_VARS_NR_UE *ue,
+   } else {
+     nb_prefix_samples  = frame_parms->nb_prefix_samples;
+     nb_prefix_samples0 = frame_parms->nb_prefix_samples;
+-  }
+-
++  } 
++  
+   dft_size_idx_t dftsize = get_dft(frame_parms->ofdm_symbol_size);
+   // This is for misalignment issues
+   int32_t tmp_dft_in[8192] __attribute__ ((aligned (32)));
+ 
+-  unsigned int rx_offset = frame_parms->get_samples_slot_timestamp(Ns,frame_parms,0);
++  unsigned int rx_offset = frame_parms->get_samples_slot_timestamp(Ns,frame_parms,0); 
+   unsigned int abs_symbol = Ns * frame_parms->symbols_per_slot + symbol;
+-  for (int idx_symb = Ns*frame_parms->symbols_per_slot; idx_symb <= abs_symbol; idx_symb++)
++  for (int idx_symb = Ns*frame_parms->symbols_per_slot; idx_symb <= abs_symbol; idx_symb++) 
+     rx_offset += (idx_symb%(0x7<<frame_parms->numerology_index)) ? nb_prefix_samples : nb_prefix_samples0;
+   rx_offset += frame_parms->ofdm_symbol_size * symbol;
+-
++ 
+   // use OFDM symbol from within 1/8th of the CP to avoid ISI
+   rx_offset -= (nb_prefix_samples / frame_parms->ofdm_offset_divisor);
+-
+-//#ifdef DEBUG_FEP
++//#ifdef DEBUG_FEP 
+   //  if (ue->frame <100)
++  LOG_D(PHY, "%d\n",frame_parms->ofdm_symbol_size);
+   LOG_D(PHY,"slot_fep: slot %d, symbol %d, nb_prefix_samples %u, nb_prefix_samples0 %u, rx_offset %u energy %d\n",
+   Ns, symbol, nb_prefix_samples, nb_prefix_samples0, rx_offset, dB_fixed(signal_energy((int32_t *)&common_vars->rxdata[0][rx_offset],frame_parms->ofdm_symbol_size)));
+-  //#endif
++  //#endif 
++  /*
++  // Initialize the argument structure
++  struct ThreadArgs args;
++  args.ptr = (int16_t *)&common_vars->rxdata[0][rx_offset];
++  args.Ns = Ns; // Set your value for Ns here
++  // Create a thread object
++  pthread_t complex_thread;
++  
++  // Create the thread
++  if (pthread_create(&complex_thread, NULL, write_complex_numbers, &args) != 0) {
++    perror("Error creating thread");
++  }
++  
++  // Wait for the thread to complete (if needed)
++  if (pthread_join(complex_thread, NULL) != 0) {
++    perror("Error joining thread");
++  } 
++  /* 
++  if(Ns == 0 || Ns == 1){
++    FILE *file = fopen("complex_numbers.txt", "a");
++    if (file == NULL) {
++      perror("Error opening file");
++      return 1;
++    } 
++    int16_t *ptr = (int16_t *)&common_vars->rxdata[0][rx_offset];
++    for (int i = 0 ; i < 23040; i++){
++      int16_t real = ptr[0];
++      int16_t imag = ptr[1];
++      // Write the complex number to the file in "real + imag j" format
++      fprintf(file, "%d+%dj\n", real, imag);
++      ptr += 1;
++    }
++  }
++  
++  int16_t *ptr = (int16_t *)&common_vars->rxdata[0][rx_offset];
++  LOG_I(PHY, "Address of ptr: %p\n", (void *)ptr);
++  LOG_I(PHY, "first symbol real: %d\n",ptr[0]); 
++  LOG_I(PHY, "first symbol imag: %d\n",ptr[1]);
++  ptr += 2; 
++  LOG_I(PHY, "Address of ptr: %p\n", (void *)ptr);
++  LOG_I(PHY, "second symbol real: %d\n",ptr[0]);
++  LOG_I(PHY, "second symbol imag: %d\n",ptr[1]);
++  */
++  if (Ns == 1){
++    Task new_task;
++    new_task.data = generate_data();
++    pthread_mutex_lock(&task_mutex);
++    
++    // Resize the queue if it's full
++    if (task_count == task_capacity) {
++      resize_task_queue();
++    } 
++    
++    task_queue[task_count++] = new_task;
++    pthread_cond_signal(&task_condition);
++    pthread_mutex_unlock(&task_mutex);
++  }
+ 
+   for (unsigned char aa=0; aa<frame_parms->nb_antennas_rx; aa++) {
+     int16_t *rxdata_ptr = (int16_t *)&common_vars->rxdata[aa][rx_offset];
+-
++ 
+     // if input to dft is not 256-bit aligned
+     if ((rx_offset & 7) != 0) {
+       memcpy((void *)&tmp_dft_in[0],
+              (void *)&common_vars->rxdata[aa][rx_offset],
+              frame_parms->ofdm_symbol_size * sizeof(int32_t));
+-
+       rxdata_ptr = (int16_t *)tmp_dft_in;
+     }
+-
++  
+     start_meas(&ue->rx_dft_stats);
+-
+     dft(dftsize,
+         rxdata_ptr,
+         (int16_t *)&rxdataF[aa][frame_parms->ofdm_symbol_size*symbol],
+-        1);
++        1); 
+ 
+     stop_meas(&ue->rx_dft_stats);
+ 
+     int symb_offset = (Ns%frame_parms->slots_per_subframe)*frame_parms->symbols_per_slot;
+     c16_t rot2 = frame_parms->symbol_rotation[0][symbol+symb_offset];
+     rot2.i=-rot2.i;
+-
++ 
+ #ifdef DEBUG_FEP
+     //  if (ue->frame <100)
+     printf("slot_fep: slot %d, symbol %d rx_offset %u, rotation symbol %d %d.%d\n", Ns,symbol, rx_offset,
+@@ -114,7 +252,7 @@ int nr_slot_fep(PHY_VARS_NR_UE *ue,
+                         (frame_parms->N_RB_DL + 1) * 6, 15);
+       rotate_cpx_vector(this_symbol + frame_parms->first_carrier_offset - 6,
+                         &rot2,
+-                        this_symbol + frame_parms->first_carrier_offset - 6,
++                        this_symbol + frame_parms->first_carrier_offset - 6, 
+                         (frame_parms->N_RB_DL + 1) * 6, 15);
+       multadd_cpx_vector((int16_t *)this_symbol, (int16_t *)shift_rot, (int16_t *)this_symbol,
+                          1, (frame_parms->N_RB_DL + 1) * 6, 15);
+@@ -181,7 +319,7 @@ int nr_slot_fep_init_sync(PHY_VARS_NR_UE *ue,
+   for (int idx_symb = Ns*frame_parms->symbols_per_slot; idx_symb <= abs_symbol; idx_symb++)
+     rx_offset += (abs_symbol%(0x7<<frame_parms->numerology_index)) ? nb_prefix_samples : nb_prefix_samples0;
+   rx_offset += frame_parms->ofdm_symbol_size * symbol;
+-
++  
+ #ifdef DEBUG_FEP
+   //  if (ue->frame <100)
+   printf("slot_fep: slot %d, symbol %d, nb_prefix_samples %u, nb_prefix_samples0 %u, slot_offset %u, sample_offset %d,rx_offset %u, frame_length_samples %u\n",
+diff --git a/openair1/PHY/NR_UE_ESTIMATION/nr_adjust_synch_ue.c b/openair1/PHY/NR_UE_ESTIMATION/nr_adjust_synch_ue.c
+index feed70b854..2ce60cb2c4 100644
+--- a/openair1/PHY/NR_UE_ESTIMATION/nr_adjust_synch_ue.c
++++ b/openair1/PHY/NR_UE_ESTIMATION/nr_adjust_synch_ue.c
+@@ -27,7 +27,7 @@
+ #include "executables/softmodem-common.h"
+ #include "common/utils/LOG/vcd_signal_dumper.h"
+ 
+-//#define DEBUG_PHY
++#define DEBUG_PHY
+ 
+ // Adjust location synchronization point to account for drift
+ // The adjustment is performed once per frame based on the
+@@ -107,7 +107,7 @@ void nr_adjust_synch_ue(NR_DL_FRAME_PARMS *frame_parms,
+   }
+ 
+ #ifdef DEBUG_PHY
+-  LOG_I(PHY,"AbsSubframe %d: diff = %i, rx_offset (final) = %i : clear = %d, max_pos = %d, max_pos_fil = %d, max_val = %d, sync_pos %d\n",
++  LOG_D(PHY,"AbsSubframe %d: diff = %i, rx_offset (final) = %i : clear = %d, max_pos = %d, max_pos_fil = %d, max_val = %d, sync_pos %d\n",
+         subframe,
+         diff,
+         ue->rx_offset,
+diff --git a/openair1/PHY/NR_UE_TRANSPORT/dci_nr.c b/openair1/PHY/NR_UE_TRANSPORT/dci_nr.c
+index 494e8a7de0..a48bcda244 100644
+--- a/openair1/PHY/NR_UE_TRANSPORT/dci_nr.c
++++ b/openair1/PHY/NR_UE_TRANSPORT/dci_nr.c
+@@ -919,12 +919,12 @@ uint8_t nr_dci_decoding_procedure(PHY_VARS_NR_UE *ue,
+       LOG_D(PHY, "(%i.%i) dci indication (rnti %x,dci format %s,n_CCE %d,payloadSize %d,payload %llx )\n",
+             proc->frame_rx, proc->nr_slot_rx,n_rnti,nr_dci_format_string[rel15->dci_format_options[k]],CCEind,dci_length, *(unsigned long long*)dci_estimation);
+       if (crc == n_rnti) {
+-        LOG_D(PHY, "(%i.%i) Received dci indication (rnti %x,dci format %s,n_CCE %d,payloadSize %d,payload %llx)\n",
++        LOG_I(PHY, "(%i.%i) Received dci indication (rnti %x,dci format %s,n_CCE %d,payloadSize %d,payload %llx)\n",
+               proc->frame_rx, proc->nr_slot_rx,n_rnti,nr_dci_format_string[rel15->dci_format_options[k]],CCEind,dci_length,*(unsigned long long*)dci_estimation);
+         uint16_t mb = nr_dci_false_detection(dci_estimation,tmp_e,L*108,n_rnti, NR_POLAR_DCI_MESSAGE_TYPE, dci_length, L);
+         ue->dci_thres = (ue->dci_thres + mb) / 2;
+         if (mb > (ue->dci_thres+30)) {
+-          LOG_W(PHY,"DCI false positive. Dropping DCI index %d. Mismatched bits: %d/%d. Current DCI threshold: %d\n",j,mb,L*108,ue->dci_thres);
++          LOG_I(PHY,"DCI false positive. Dropping DCI index %d. Mismatched bits: %d/%d. Current DCI threshold: %d\n",j,mb,L*108,ue->dci_thres);
+           continue;
+         }
+         else {
+diff --git a/openair1/SCHED_NR_UE/phy_procedures_nr_ue.c b/openair1/SCHED_NR_UE/phy_procedures_nr_ue.c
+index 8dec02b0a1..7564a1301e 100644
+--- a/openair1/SCHED_NR_UE/phy_procedures_nr_ue.c
++++ b/openair1/SCHED_NR_UE/phy_procedures_nr_ue.c
+@@ -74,20 +74,21 @@ fifo_dump_emos_UE emos_dump_UE;
+ #include "UTIL/OPT/opt.h"
+ #include "intertask_interface.h"
+ #include "T.h"
+-
++ 
+ #if defined(OAI_USRP) || defined(OAI_BLADERF) || defined(OAI_LMSSDR) || defined(OAI_ADRV9371_ZC706)
+ extern uint64_t downlink_frequency[MAX_NUM_CCs][4];
+ #endif
+ 
+ unsigned int gain_table[31] = {100,112,126,141,158,178,200,224,251,282,316,359,398,447,501,562,631,708,794,891,1000,1122,1258,1412,1585,1778,1995,2239,2512,2818,3162};
+ 
++
+ void nr_fill_dl_indication(nr_downlink_indication_t *dl_ind,
+                            fapi_nr_dci_indication_t *dci_ind,
+                            fapi_nr_rx_indication_t *rx_ind,
+                            UE_nr_rxtx_proc_t *proc,
+                            PHY_VARS_NR_UE *ue,
+                            void *phy_data)
+-{
++{  
+   memset((void*)dl_ind, 0, sizeof(nr_downlink_indication_t));
+ 
+   dl_ind->gNB_index = proc->gNB_id;
+@@ -125,7 +126,7 @@ void nr_fill_rx_indication(fapi_nr_rx_indication_t *rx_ind,
+   }
+ 
+   NR_DL_UE_HARQ_t *dl_harq0 = NULL;
+-
++ 
+   if ((pdu_type !=  FAPI_NR_RX_PDU_TYPE_SSB) && dlsch0) {
+     dl_harq0 = &ue->dl_harq_processes[0][dlsch0->dlsch_config.harq_process_nbr];
+     trace_NRpdu(DIRECTION_DOWNLINK,
+@@ -320,7 +321,7 @@ void nr_ue_measurement_procedures(uint16_t l,
+       ue->common_vars.rxdata);
+ 
+     nr_ue_measurements(ue, proc, dlsch, pdsch_est_size, dl_ch_estimates);
+-
++ 
+ #if T_TRACER
+     if(nr_slot_rx == 0)
+       T(T_UE_PHY_MEAS, T_INT(gNB_id),  T_INT(ue->Mod_id), T_INT(frame_rx%1024), T_INT(nr_slot_rx),
+@@ -901,7 +902,7 @@ void pbch_pdcch_processing(PHY_VARS_NR_UE *ue,
+           __attribute__ ((aligned(32))) struct complex16 dl_ch_estimates_time[fp->nb_antennas_rx][fp->ofdm_symbol_size];
+ 
+           for (int i=1; i<4; i++) {
+-            nr_slot_fep(ue,
++            nr_slot_fep(ue, 
+                         proc,
+                         (ssb_start_symbol+i)%(fp->symbols_per_slot),
+                         rxdataF);
+@@ -928,7 +929,7 @@ void pbch_pdcch_processing(PHY_VARS_NR_UE *ue,
+ 
+           if(ssb_index == fp->ssb_index) {
+ 
+-            LOG_D(PHY," ------  Decode MIB: frame.slot %d.%d ------  \n", frame_rx%1024, nr_slot_rx);
++            LOG_I(PHY, "Decode MIB: frame.slot %d.%d ------  \n", frame_rx%1024, nr_slot_rx);
+             nr_ue_pbch_procedures(ue, proc, estimateSz, dl_ch_estimates, phy_data, rxdataF);
+ 
+             if (ue->no_timing_correction==0) {
+@@ -951,7 +952,7 @@ void pbch_pdcch_processing(PHY_VARS_NR_UE *ue,
+       }
+     }
+   }
+-
++ 
+   // Check for PRS slot - section 7.4.1.7.4 in 3GPP rel16 38.211
+   for(int gNB_id = 0; gNB_id < ue->prs_active_gNBs; gNB_id++)
+   {
+@@ -980,7 +981,7 @@ void pbch_pdcch_processing(PHY_VARS_NR_UE *ue,
+     } // for rsc_id
+   } // for gNB_id
+ 
+-  if ((frame_rx%64 == 0) && (nr_slot_rx==0)) {
++  if ((frame_rx%64 == 0) && (nr_slot_rx==1)) {
+     LOG_I(NR_PHY,"============================================\n");
+     // fixed text + 8 HARQs rounds à 10 ("999999999/") + NULL
+     // if we use 999999999 HARQs, that should be sufficient for at least 138 hours
+@@ -992,7 +993,6 @@ void pbch_pdcch_processing(PHY_VARS_NR_UE *ue,
+     for (int round = 1; round < 16 && (round < 3 || ue->dl_stats[round] != 0); ++round)
+       p += snprintf(p, end - p,"/%d", ue->dl_stats[round]);
+     LOG_I(NR_PHY,"%s\n", output);
+-
+     LOG_I(NR_PHY,"============================================\n");
+   }
+ 
+@@ -1003,7 +1003,6 @@ void pbch_pdcch_processing(PHY_VARS_NR_UE *ue,
+ 
+   uint8_t nb_symb_pdcch = phy_pdcch_config->nb_search_space > 0 ? phy_pdcch_config->pdcch_config[0].coreset.duration : 0;
+   for (uint16_t l=0; l<nb_symb_pdcch; l++) {
+-
+     start_meas(&ue->ofdm_demod_stats);
+     nr_slot_fep(ue,
+                 proc,
+@@ -1018,9 +1017,9 @@ void pbch_pdcch_processing(PHY_VARS_NR_UE *ue,
+   uint8_t dci_cnt = 0;
+   for(int n_ss = 0; n_ss<phy_pdcch_config->nb_search_space; n_ss++) {
+     for (uint16_t l=0; l<nb_symb_pdcch; l++) {
+-
++      // wyj sep 26 8:00 pm
+       // note: this only works if RBs for PDCCH are contigous!
+-
++      LOG_D(PHY, "pdcch channel estimation here\n");
+       nr_pdcch_channel_estimation(ue,
+                                   proc,
+                                   l,
+@@ -1029,17 +1028,15 @@ void pbch_pdcch_processing(PHY_VARS_NR_UE *ue,
+                                   phy_pdcch_config->pdcch_config[n_ss].BWPStart,
+                                   pdcch_est_size,
+                                   pdcch_dl_ch_estimates,
+-                                  rxdataF);
+-
++                                  rxdataF); 
+       stop_meas(&ue->ofdm_demod_stats);
+-
+-    }
++    } 
+     dci_cnt = dci_cnt + nr_ue_pdcch_procedures(ue, proc, pdcch_est_size, pdcch_dl_ch_estimates, phy_data, n_ss, rxdataF);
+   }
+   LOG_D(PHY,"[UE %d] Frame %d, nr_slot_rx %d: found %d DCIs\n", ue->Mod_id, frame_rx, nr_slot_rx, dci_cnt);
+   phy_pdcch_config->nb_search_space = 0;
+   VCD_SIGNAL_DUMPER_DUMP_FUNCTION_BY_NAME(VCD_SIGNAL_DUMPER_FUNCTIONS_UE_SLOT_FEP_PDCCH, VCD_FUNCTION_OUT);
+-}
++} 
+ 
+ void pdsch_processing(PHY_VARS_NR_UE *ue,
+                       UE_nr_rxtx_proc_t *proc,
+@@ -1062,7 +1059,7 @@ void pdsch_processing(PHY_VARS_NR_UE *ue,
+     VCD_SIGNAL_DUMPER_DUMP_FUNCTION_BY_NAME(VCD_SIGNAL_DUMPER_FUNCTIONS_UE_SLOT_FEP_PDSCH, VCD_FUNCTION_IN);
+     uint16_t nb_symb_sch = dlsch[0].dlsch_config.number_symbols;
+     uint16_t start_symb_sch = dlsch[0].dlsch_config.start_symbol;
+-
++ 
+     LOG_D(PHY," ------ --> PDSCH ChannelComp/LLR Frame.slot %d.%d ------  \n", frame_rx%1024, nr_slot_rx);
+     //to update from pdsch config
+ 

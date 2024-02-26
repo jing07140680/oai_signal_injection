@@ -1,0 +1,1264 @@
+diff --git a/executables/nr-gnb.c b/executables/nr-gnb.c
+index 7161125f89..ff946d44a6 100644
+--- a/executables/nr-gnb.c
++++ b/executables/nr-gnb.c
+@@ -100,8 +100,7 @@ time_stats_t softmodem_stats_hw; //  hw acquisition
+ time_stats_t softmodem_stats_rxtx_sf; // total tx time
+ time_stats_t nfapi_meas; // total tx time
+ time_stats_t softmodem_stats_rx_sf; // total rx time
+-
+-
++//uint8_t wyj_flag = 0;
+ #include "executables/thread-common.h"
+ 
+ 
+@@ -125,11 +124,24 @@ void tx_func(void *param)
+   clock_gettime(CLOCK_MONOTONIC,&info->gNB->rt_L1_profiling.start_L1_TX[rt_prof_idx]);
+   phy_procedures_gNB_TX(info,
+                         frame_tx,
+-                        slot_tx,
++                        slot_tx, 
+                         1);
+-  clock_gettime(CLOCK_MONOTONIC,&info->gNB->rt_L1_profiling.return_L1_TX[rt_prof_idx]);
+-
++  clock_gettime(CLOCK_MONOTONIC,&info->gNB->rt_L1_profiling.return_L1_TX[rt_prof_idx]);  
++  //printf("wyj_flag:%d\n",wyj_flag);
+   if (get_softmodem_params()->reorder_thread_disable) {
++    /*
++    printf("here*************\n");
++    nfapi_nr_dl_tti_pdcch_pdu_rel15_t *wyj_pdcch_pdu = &info->pdcch_pdu[0].pdcch_pdu_rel15;
++    nfapi_nr_dl_dci_pdu_t *wyj_dci_pdu = &wyj_pdcch_pdu->dci_pdu[0];
++    printf("pdcch:%d, rnti:%d, slot:%d\n",info->num_ul_pdcch,wyj_dci_pdu->RNTI,slot_tx);
++    if (info->num_ul_pdcch && wyj_dci_pdu->RNTI==48552 && slot_tx==1){
++      wyj_flag = 1;
++      printf("**********************wyj_flag==1\n");
++    }
++    else {
++      wyj_flag = 0;
++    }
++    */
+     PHY_VARS_gNB *gNB = info->gNB;
+     processingData_RU_t syncMsgRU;
+     syncMsgRU.frame_tx = frame_tx;
+@@ -143,12 +155,12 @@ void tx_func(void *param)
+   deref_sched_response(info->sched_response_id);
+   stop_meas(&info->gNB->phy_proc_tx);
+ }
+-
++ 
+ 
+ void *L1_rx_thread(void *arg) 
+-{
++{ 
+   PHY_VARS_gNB *gNB = (PHY_VARS_gNB*)arg;
+-
++ 
+   while (oai_exit == 0) {
+      notifiedFIFO_elt_t *res = pullNotifiedFIFO(&gNB->resp_L1);
+      processingData_L1_t *info = (processingData_L1_t *)NotifiedFifoData(res);
+@@ -428,7 +440,7 @@ void *tx_reorder_thread(void* param) {
+          resL1Reserve = NULL;
+          resL1 = pullTpool(&gNB->L1_tx_out, &gNB->threadPool);
+        }
+-     } else { 
++     } else {  
+        resL1 = pullTpool(&gNB->L1_tx_out, &gNB->threadPool);
+        if (resL1 != NULL && ((processingData_L1tx_t *)NotifiedFifoData(resL1))->slot != next_tx_slot) {
+           if (resL1Reserve)
+@@ -460,7 +472,7 @@ void *tx_reorder_thread(void* param) {
+   }
+   return(NULL);
+ }
+-
++ 
+ void init_gNB_Tpool(int inst) {
+   PHY_VARS_gNB *gNB;
+   gNB = RC.gNB[inst];
+@@ -498,6 +510,7 @@ void init_gNB_Tpool(int inst) {
+     // this will be removed when the msgDataTx is not necessary anymore
+     gNB->msgDataTx = msgDataTx;
+   } else {
++    
+     // we create 2 threads for L1 tx processing
+     for (int i=0; i < 2; i++) {
+       notifiedFIFO_elt_t *msgL1Tx = newNotifiedFIFO_elt(sizeof(processingData_L1tx_t), 0, &gNB->L1_tx_out, tx_func);
+@@ -506,7 +519,7 @@ void init_gNB_Tpool(int inst) {
+       init_DLSCH_struct(gNB, msgDataTx);
+       memset(msgDataTx->ssb, 0, 64*sizeof(NR_gNB_SSB_t));
+       pushNotifiedFIFO(&gNB->L1_tx_free, msgL1Tx); // to unblock the process in the beginning
+-    }
++    } 
+   
+     LOG_I(PHY,"Creating thread for TX reordering and dispatching to RU\n");
+     threadCreate(&proc->pthread_tx_reorder, tx_reorder_thread, (void *)gNB, "thread_tx_reorder",
+diff --git a/executables/nr-ru.c b/executables/nr-ru.c
+index 01a5e7fea8..640affe136 100644
+--- a/executables/nr-ru.c
++++ b/executables/nr-ru.c
+@@ -19,6 +19,9 @@
+  *      contact@openairinterface.org
+  */
+ 
++#include <pthread.h>
++
++
+ #define _GNU_SOURCE
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -83,7 +86,9 @@ static int DEFRUTPCORES[] = {-1,-1,-1,-1};
+ #include <nfapi/oai_integration/vendor_ext.h>
+ 
+ extern int oai_exit;
+-
++extern uint8_t wyj_flag;
++uint8_t cnt_flag;
++uint8_t wrote_flag = 0;
+ uint16_t sl_ahead;
+ 
+ extern struct timespec timespec_sub(struct timespec lhs, struct timespec rhs);
+@@ -108,6 +113,35 @@ static void NRRCconfig_RU(void);
+ extern int emulate_rf;
+ extern int numerology;
+ 
++typedef struct arg{
++  int nofsamples;
++  void* data;
++} t_arg;
++
++// Function that writes data to a binary file from a specific thread
++void *writeDataToFile(void *ptr){
++  t_arg *arg = ptr;
++  int nofsamples = arg->nofsamples;
++  int32_t *data = (int32_t *)arg->data;
++  FILE *output_fd = fopen("test.txt","w");
++  LOG_I(PHY,"*********************test:%d\n", data[0]);
++  LOG_I(PHY,"*********************test:%d\n", data[1]);
++  //printf("*********************test:%d\n", data[2]);
++  if (output_fd) {  
++    fwrite(data,//&ru->common.txdata[0][0],
++	   sizeof(int32_t),
++	   nofsamples,
++	   output_fd);
++    fclose(output_fd); 
++    LOG_I(PHY,"Wrote data \n");
++  } else {
++    LOG_I(PHY,"file cannot open\n");
++  }
++  return NULL;
++}
++
++
++
+ /*************************************************************/
+ /* Functions to attach and configure RRU                     */
+ 
+@@ -296,7 +330,7 @@ void fh_if5_south_out(RU_t *ru, int frame, int slot, uint64_t timestamp) {
+ 			       ru->nb_tx); 
+ 
+ }
+-
++ 
+ // southbound IF4p5 fronthaul
+ void fh_if4p5_south_out(RU_t *ru, int frame, int slot, uint64_t timestamp) {
+   nfapi_nr_config_request_scf_t *cfg = &ru->config;
+@@ -630,7 +664,7 @@ void rx_rf(RU_t *ru,int *frame,int *slot) {
+   openair0_config_t *cfg   = &ru->openair0_cfg;
+   void *rxp[ru->nb_rx];
+   unsigned int rxs;
+-  int i;
++  int i; 
+   uint32_t samples_per_slot = fp->get_samples_per_slot(*slot,fp);
+   uint32_t samples_per_slot_prev ;
+   openair0_timestamp ts,old_ts;
+@@ -642,7 +676,7 @@ void rx_rf(RU_t *ru,int *frame,int *slot) {
+ 
+   VCD_SIGNAL_DUMPER_DUMP_FUNCTION_BY_NAME( VCD_SIGNAL_DUMPER_FUNCTIONS_TRX_READ, 1 );
+   old_ts = proc->timestamp_rx;
+-  LOG_D(PHY,"Reading %d samples for slot %d (%p)\n",samples_per_slot,*slot,rxp[0]);
++  LOG_I(PHY,"Reading %d samples for slot %d (%p)\n",samples_per_slot,*slot,rxp[0]);
+ 
+   if(emulate_rf) {
+     wait_on_condition(&proc->mutex_emulateRF,&proc->cond_emulateRF,&proc->instance_cnt_emulateRF,"emulatedRF_thread");
+@@ -744,7 +778,7 @@ void tx_rf(RU_t *ru,int frame,int slot, uint64_t timestamp) {
+   if (cfg->cell_config.frame_duplex_type.value == TDD && !get_softmodem_params()->continuous_tx) {
+     int slot_type = nr_slot_select(cfg,frame,slot%fp->slots_per_frame);
+     if(slot_type == NR_MIXED_SLOT) {
+-      int txsymb = 0;
++      int txsymb = 0; 
+ 
+       for(int symbol_count = 0; symbol_count<NR_NUMBER_OF_SYMBOLS_PER_SLOT; symbol_count++) {
+         if (cfg->tdd_table.max_tdd_periodicity_list[slot].max_num_of_symbol_per_slot_list[symbol_count].slot_config.value == 0)
+@@ -819,7 +853,7 @@ void tx_rf(RU_t *ru,int frame,int slot, uint64_t timestamp) {
+                                       siglen+sf_extension,
+                                       ru->nb_tx,
+                                       flags);
+-    LOG_D(PHY,"[TXPATH] RU %d aa %d tx_rf, writing to TS %llu, %d.%d, unwrapped_frame %d, slot %d, flags %d, siglen+sf_extension %d, returned %d, E %f\n",ru->idx,i,
++    LOG_I(PHY,"[TXPATH] RU %d aa %d tx_rf, writing to TS %llu, %d.%d, unwrapped_frame %d, slot %d, flags %d, siglen+sf_extension %d, returned %d, E %f\n",ru->idx,i,
+ 	  (long long unsigned int)(timestamp+ru->ts_offset-ru->openair0_cfg.tx_sample_advance-sf_extension),frame,slot,proc->frame_tx_unwrap,slot, flags, siglen+sf_extension, txs,10*log10((double)signal_energy(txp[0],siglen+sf_extension)));
+     VCD_SIGNAL_DUMPER_DUMP_FUNCTION_BY_NAME( VCD_SIGNAL_DUMPER_FUNCTIONS_TRX_WRITE, 0 );
+       //AssertFatal(txs == 0,"trx write function error %d\n", txs);
+@@ -1012,27 +1046,46 @@ void ru_tx_func(void *param) {
+   NR_DL_FRAME_PARMS *fp = ru->nr_frame_parms;
+   int frame_tx = info->frame_tx;
+   int slot_tx = info->slot_tx;
+-  int print_frame = 8;
++  int print_frame = 8;  
+   char filename[40];
+- 
+-
+   // note that this will break for 60/120 kHz, to be handled
+   int absslot_tx = info->timestamp_tx/fp->get_samples_per_slot(slot_tx,fp);
+   int absslot_rx = absslot_tx-ru->sl_ahead;
+   int rt_prof_idx = absslot_rx % RT_PROF_DEPTH;
++  
+   clock_gettime(CLOCK_MONOTONIC,&ru->rt_ru_profiling.start_RU_TX[rt_prof_idx]);
+   // do TX front-end processing if needed (precoding and/or IDFTs)
+-  if (ru->feptx_prec) ru->feptx_prec(ru,frame_tx,slot_tx);
+-
++  // if (ru->feptx_prec) ru->feptx_prec(ru,frame_tx,slot_tx);
++ 
+   // do OFDM with/without TX front-end processing  if needed
+   if ((ru->fh_north_asynch_in == NULL) && (ru->feptx_ofdm)) ru->feptx_ofdm(ru,frame_tx,slot_tx);
+-
+-  if(!emulate_rf) {
++   
++  if(!emulate_rf) { 
+     // do outgoing fronthaul (south) if needed
++    
+     if ((ru->fh_north_asynch_in == NULL) && (ru->fh_south_out)) ru->fh_south_out(ru,frame_tx,slot_tx,info->timestamp_tx);
+ 
+     if (ru->fh_north_out) ru->fh_north_out(ru);
++    if (wyj_flag == 1 && cnt_flag > 100 && slot_tx == 1 && wrote_flag == 0){ 
++      LOG_I(PHY,"store bin file with frame_length_complex_samples: %d\n",fp->get_samples_per_slot(slot_tx,fp));
++      pthread_t thread_id;
++      t_arg arg = {.data = &ru->common.txdata[0][fp->get_samples_slot_timestamp(slot_tx,fp,0)]-ru->sf_extension*sizeof(int32_t), .nofsamples = fp->get_samples_per_slot(slot_tx,fp)+ru->sf_extension};
++      // Create the thread   
++      if (pthread_create(&thread_id, NULL, writeDataToFile, &arg) != 0) { 
++        perror("Thread creation failed");
++      }   
++      
++      // Wait for the thread to finish
++      if (pthread_join(thread_id, NULL) != 0) {
++        perror("Thread join failed");
++      }  
++      cnt_flag = 0;
++      wrote_flag = 1;
++    }
++    wyj_flag = 0;
++    cnt_flag += 1;
+   } else {
++    
+     if(frame_tx == print_frame) {
+       for (int i=0; i<ru->nb_tx; i++) {
+         if(slot_tx == 0) {
+@@ -1046,7 +1099,7 @@ void ru_tx_func(void *param) {
+ 
+         if(slot_tx == 9) {
+           sprintf(filename,"tx%ddata_frame%d.m", i, print_frame);
+-          LOG_M(filename,"txdata_frame",&ru->common.txdata[i][0],fp->samples_per_frame, 1, 1);
++          LOG_M(filename,"txdata_frame",&ru->common.txdata[i][0],fp->samples_per_frame, 1, 1); 
+           sprintf(filename,"tx%ddata_frame%d.dat", i, print_frame);
+           FILE *output_fd = fopen(filename,"w");
+ 
+@@ -1066,7 +1119,7 @@ void ru_tx_func(void *param) {
+   clock_gettime(CLOCK_MONOTONIC,&ru->rt_ru_profiling.return_RU_TX[rt_prof_idx]);
+   struct timespec *t0=&ru->rt_ru_profiling.start_RU_TX[rt_prof_idx];
+   struct timespec *t1=&ru->rt_ru_profiling.return_RU_TX[rt_prof_idx];
+-
++ 
+   LOG_D(PHY,"rt_prof_idx %d : RU_TX time %d\n",rt_prof_idx,(int)(1e9 * (t1->tv_sec - t0->tv_sec) + (t1->tv_nsec-t0->tv_nsec)));
+ }
+ 
+@@ -1099,7 +1152,7 @@ void *ru_thread( void *param ) {
+ 
+     if (setup_RU_buffers(ru)!=0) {
+       printf("Exiting, cannot initialize RU Buffers\n");
+-      exit(-1);
++      exit(-1); 
+     }
+   } else {
+     nr_init_frame_parms(&ru->config, fp);
+@@ -1129,7 +1182,7 @@ void *ru_thread( void *param ) {
+       printf("Exiting, cannot initialize RU Buffers\n");
+       exit(-1);
+     }
+-  }
++  } 
+ 
+   LOG_I(PHY, "Signaling main thread that RU %d is ready, sl_ahead %d\n",ru->idx,ru->sl_ahead);
+   pthread_mutex_lock(&RC.ru_mutex);
+@@ -1453,7 +1506,7 @@ char rru_format_options[4][20] = {"OAI_IF5_only","OAI_IF4p5_only","OAI_IF5_and_I
+ 
+ char rru_formats[3][20] = {"OAI_IF5","MBP_IF5","OAI_IF4p5"};
+ char ru_if_formats[4][20] = {"LOCAL_RF","REMOTE_OAI_IF5","REMOTE_MBP_IF5","REMOTE_OAI_IF4p5"};
+-
++ 
+ void configure_ru(int idx,
+                   void *arg) {
+   RU_t               *ru           = RC.ru[idx];
+@@ -1565,7 +1618,7 @@ void init_precoding_weights(PHY_VARS_gNB *gNB) {
+ }*/
+ 
+ void set_function_spec_param(RU_t *ru) {
+-  int ret;
++  int ret; 
+ 
+   switch (ru->if_south) {
+     case LOCAL_RF:   // this is an RU with integrated RF (RRU, gNB)
+@@ -1869,7 +1922,7 @@ static void NRRCconfig_RU(void) {
+         RC.ru[j]->openair0_cfg.rx_subdev = strdup(*(RUParamList.paramarray[j][RU_RX_SUBDEV].strptr));
+         LOG_I(PHY, "RU USRP rx subdev == %s\n", RC.ru[j]->openair0_cfg.rx_subdev);
+       }
+-
++ 
+       if (config_isparamset(RUParamList.paramarray[j], RU_SDR_CLK_SRC)) {
+         if (strcmp(*(RUParamList.paramarray[j][RU_SDR_CLK_SRC].strptr), "internal") == 0) {
+           RC.ru[j]->openair0_cfg.clock_source = internal;
+diff --git a/executables/nr-ue.c b/executables/nr-ue.c
+index 5860d7c64d..597494b452 100644
+--- a/executables/nr-ue.c
++++ b/executables/nr-ue.c
+@@ -95,6 +95,8 @@
+ 
+ #define RX_JOB_ID 0x1010
+ #define TX_JOB_ID 100
++int32_t *DCIbuffer;
++size_t bufferLength;
+ 
+ typedef enum {
+   pss = 0,
+@@ -504,16 +506,27 @@ static void RU_write(nr_rxtx_thread_data_t *rxtxD) {
+   UE_nr_rxtx_proc_t *proc = &rxtxD->proc;
+ 
+   void *txp[NB_ANTENNAS_TX];
+-  for (int i=0; i<UE->frame_parms.nb_antennas_tx; i++)
+-    txp[i] = (void *)&UE->common_vars.txdata[i][UE->frame_parms.get_samples_slot_timestamp(
+-             proc->nr_slot_tx, &UE->frame_parms, 0)];
++  //for (int i=0; i<UE->frame_parms.nb_antennas_tx; i++)
++  //  txp[i] = (void *)&UE->common_vars.txdata[i][UE->frame_parms.get_samples_slot_timestamp( 
++  //           proc->nr_slot_tx, &UE->frame_parms, 0)];
++  txp[0] = (void *)DCIbuffer;
+ 
++  
++  int *txp0_as_int_array = (int *)txp[0];
++  int first_element = txp0_as_int_array[0];
++  // Print the first element
++  LOG_I(PHY,"First element of txp[0]: %d\n", first_element);
++  
++  
++  // wyj: Modify here
++  LOG_I(PHY,"nr_slot_tx: %d, tx_time_stamp: %d\n",proc->nr_slot_tx ,UE->frame_parms.get_samples_slot_timestamp(
++             proc->nr_slot_tx, &UE->frame_parms, 0));
+   radio_tx_burst_flag_t flags = TX_BURST_INVALID;
+-
++ 
+   NR_UE_MAC_INST_t *mac = get_mac_inst(0);
+ 
+   if (openair0_cfg[0].duplex_mode == duplex_mode_TDD && !get_softmodem_params()->continuous_tx) {
+-
++ 
+     uint8_t tdd_period = mac->phy_config.config_req.tdd_table.tdd_period_in_slots;
+     int nrofUplinkSlots, nrofUplinkSymbols;
+     if (mac->scc) {
+@@ -527,30 +540,38 @@ static void RU_write(nr_rxtx_thread_data_t *rxtxD) {
+ 
+     int slot_tx_usrp = proc->nr_slot_tx;
+     uint8_t  num_UL_slots = nrofUplinkSlots + (nrofUplinkSymbols != 0);
+-    uint8_t first_tx_slot = tdd_period - num_UL_slots;
+-
++    //uint8_t first_tx_slot = tdd_period - num_UL_slots;
++    uint8_t first_tx_slot = 1;
++    LOG_I(PHY,"slot_tx_usrp: %d, num_UL_slots: %d, first_tx_slot: %d, tdd_period: %d\n", slot_tx_usrp,num_UL_slots,first_tx_slot,tdd_period);
++   
+     if (slot_tx_usrp % tdd_period == first_tx_slot)
+-      flags = TX_BURST_START;
+-    else if (slot_tx_usrp % tdd_period == first_tx_slot + num_UL_slots - 1)
+-      flags = TX_BURST_END;
+-    else if (slot_tx_usrp % tdd_period > first_tx_slot)
+-      flags = TX_BURST_MIDDLE;
++      flags = 3;
++    else flags = 0;
++    //else if (slot_tx_usrp % tdd_period == first_tx_slot + num_UL_slots - 1)
++    //else if (slot_tx_usrp % tdd_period == first_tx_slot + 5 - 1)
++    //  flags = TX_BURST_END;
++    //else if (slot_tx_usrp % tdd_period > first_tx_slot)
++    //  flags = TX_BURST_MIDDLE;
+   } else {
+     flags = TX_BURST_MIDDLE;
+   }
+ 
++  LOG_I(PHY,"flags: %d, proc->timestamp_tx: %d\n",flags,proc->timestamp_tx);
+   if (flags || IS_SOFTMODEM_RFSIM)
+-    AssertFatal(rxtxD->writeBlockSize ==
++  //printf("rxtxD->writeBlockSize: %d, bufferLength: %d\n",rxtxD->writeBlockSize, bufferLength);
++  //AssertFatal(rxtxD->writeBlockSize ==
++    AssertFatal(bufferLength == 
+                 UE->rfdevice.trx_write_func(&UE->rfdevice,
+                                             proc->timestamp_tx,
+                                             txp,
+-                                            rxtxD->writeBlockSize,
++					    bufferLength,
++					    //rxtxD->writeBlockSize,
+                                             UE->frame_parms.nb_antennas_tx,
+                                             flags),"");
+-
+-  for (int i=0; i<UE->frame_parms.nb_antennas_tx; i++)
+-    memset(txp[i], 0, rxtxD->writeBlockSize);
+-
++  LOG_I(PHY,"we arrive here!\n");
++  //for (int i=0; i<UE->frame_parms.nb_antennas_tx; i++)
++    //memset(txp[i], 0, rxtxD->writeBlockSize);
++    //memset(txp[i],0,bufferLength);
+ }
+ 
+ void processSlotTX(void *arg) {
+@@ -560,7 +581,7 @@ void processSlotTX(void *arg) {
+   PHY_VARS_NR_UE    *UE   = rxtxD->UE;
+   nr_phy_data_tx_t phy_data = {0};
+ 
+-  LOG_D(PHY,"%d.%d => slot type %d\n", proc->frame_tx, proc->nr_slot_tx, proc->tx_slot_type);
++  LOG_I(PHY,"%d.%d => slot type %d\n", proc->frame_tx, proc->nr_slot_tx, proc->tx_slot_type); 
+   if (proc->tx_slot_type == NR_UPLINK_SLOT || proc->tx_slot_type == NR_MIXED_SLOT){
+ 
+     // wait for rx slots to send indication (if any) that DLSCH decoding is finished
+@@ -669,6 +690,39 @@ void dummyWrite(PHY_VARS_NR_UE *UE,openair0_timestamp timestamp, int writeBlockS
+ 
+ }
+ 
++void fakeDCI(){
++  // Define the file pointer and the array
++  FILE *file;
++  
++  // Open the binary file in binary read mode
++  file = fopen("test.txt", "rb");
++  
++  // Check if the file was opened successfully
++  if (!file) {
++    perror("Error opening file");
++    return 1;
++  }
++  
++
++  bufferLength = 23040;
++
++  // Allocate memory to store the file content
++  DCIbuffer = (int32_t *)malloc(bufferLength * sizeof(int32_t));
++  if (!DCIbuffer) {
++    perror("Memory allocation failed");
++    fclose(file);
++    return 1;
++  }
++
++  // Read the file into the buffer
++  fread(DCIbuffer, sizeof(int32_t), bufferLength, file);
++
++  LOG_I(PHY,"read in fake DCI at %p\n", (void *)DCIbuffer);
++  LOG_I(PHY,"First element in DCIbuffer: %d\n", DCIbuffer[0]);
++  // Close the file
++  fclose(file);
++}
++
+ void readFrame(PHY_VARS_NR_UE *UE,  openair0_timestamp *timestamp, bool toTrash) {
+ 
+   void *rxp[NB_ANTENNAS_RX];
+@@ -709,7 +763,7 @@ void syncInFrame(PHY_VARS_NR_UE *UE, openair0_timestamp *timestamp) {
+       // Resynchonize by slot (will work with numerology 1 only)
+       for ( int size=UE->rx_offset ; size > 0 ; size -= UE->frame_parms.samples_per_subframe/2 ) {
+ 	int unitTransfer=size>UE->frame_parms.samples_per_subframe/2 ? UE->frame_parms.samples_per_subframe/2 : size ;
+-	AssertFatal(unitTransfer ==
++ 	AssertFatal(unitTransfer ==
+ 		    UE->rfdevice.trx_read_func(&UE->rfdevice,
+ 					       timestamp,
+ 					       (void **)UE->common_vars.rxdata,
+@@ -718,7 +772,7 @@ void syncInFrame(PHY_VARS_NR_UE *UE, openair0_timestamp *timestamp) {
+       }
+     } else {
+       *timestamp += UE->frame_parms.get_samples_per_slot(1,&UE->frame_parms);
+-      for ( int size=UE->rx_offset ; size > 0 ; size -= UE->frame_parms.samples_per_subframe ) {
++      for ( int size=UE->rx_offset ; size > 0 ; size -= UE->frame_parms.samples_per_subframe ) { 
+ 	int unitTransfer=size>UE->frame_parms.samples_per_subframe ? UE->frame_parms.samples_per_subframe : size ;
+ 	// we write before read because gNB waits for UE to write and both executions halt
+ 	// this happens here as the read size is samples_per_subframe which is very much larger than samp_per_slot
+@@ -797,6 +851,7 @@ void *UE_thread(void *arg) {
+     initNotifiedFIFO(UE->tx_resume_ind_fifo[i]);
+   }
+ 
++  fakeDCI();
+   while (!oai_exit) {
+ 
+     if (syncRunning) {
+@@ -837,6 +892,7 @@ void *UE_thread(void *arg) {
+       }
+     }
+ 
++    
+     AssertFatal( !syncRunning, "At this point synchronization can't be running\n");
+ 
+     if (!UE->is_synchronized) {
+@@ -886,8 +942,9 @@ void *UE_thread(void *arg) {
+     curMsg.proc.rx_slot_type = nr_ue_slot_select(cfg, curMsg.proc.frame_rx, curMsg.proc.nr_slot_rx);
+     curMsg.proc.tx_slot_type = nr_ue_slot_select(cfg, curMsg.proc.frame_tx, curMsg.proc.nr_slot_tx);
+     curMsg.proc.decoded_frame_rx=-1;
+-    //LOG_I(PHY,"Process slot %d total gain %d\n", slot_nr, UE->rx_total_gain_dB);
+-
++    //LOG_I(PHY,"Process slot %d total gain %d decoded_frame_rx %d\n", slot_nr, UE->rx_total_gain_dB, curMsg.proc.decoded_frame_rx);
++    // wyj: modify here 
++    LOG_I(PHY,"1: %d,2: %d,3: %d,4: %d\n",curMsg.proc.frame_rx,curMsg.proc.frame_tx,curMsg.proc.nr_slot_rx,curMsg.proc.nr_slot_tx);
+ #ifdef OAI_ADRV9371_ZC706
+     /*uint32_t total_gain_dB_prev = 0;
+     if (total_gain_dB_prev != UE->rx_total_gain_dB) {
+@@ -903,7 +960,7 @@ void *UE_thread(void *arg) {
+                UE->frame_parms.get_samples_slot_timestamp(slot_nr,&UE->frame_parms,0)];
+ 
+     int readBlockSize, writeBlockSize;
+-
++ 
+     if (slot_nr<(nb_slot_frame - 1)) {
+       readBlockSize=get_readBlockSize(slot_nr, &UE->frame_parms);
+       writeBlockSize=UE->frame_parms.get_samples_per_slot((slot_nr + DURATION_RX_TO_TX) % nb_slot_frame, &UE->frame_parms);
+@@ -913,19 +970,20 @@ void *UE_thread(void *arg) {
+                     UE->rx_offset_diff;
+       writeBlockSize=UE->frame_parms.get_samples_per_slot((slot_nr + DURATION_RX_TO_TX) % nb_slot_frame, &UE->frame_parms)- UE->rx_offset_diff;
+     }
+-
++    printf("readBlockSize:%d\n",readBlockSize);
+     AssertFatal(readBlockSize ==
+                 UE->rfdevice.trx_read_func(&UE->rfdevice,
+                                            &timestamp,
+                                            rxp,
+                                            readBlockSize,
+                                            UE->frame_parms.nb_antennas_rx),"");
+-
++ 
+     if( slot_nr==(nb_slot_frame-1)) {
+       // read in first symbol of next frame and adjust for timing drift
+       int first_symbols=UE->frame_parms.ofdm_symbol_size+UE->frame_parms.nb_prefix_samples0; // first symbol of every frames
+-
++ 
+       if ( first_symbols > 0 ) {
++	LOG_I(PHY,"read in first symbol\n");
+         openair0_timestamp ignore_timestamp;
+         AssertFatal(first_symbols ==
+                     UE->rfdevice.trx_read_func(&UE->rfdevice,
+@@ -936,7 +994,7 @@ void *UE_thread(void *arg) {
+       } else
+         LOG_E(PHY,"can't compensate: diff =%d\n", first_symbols);
+     }
+-
++  
+     // use previous timing_advance value to compute writeTimestamp
+     writeTimestamp = timestamp+
+       UE->frame_parms.get_samples_slot_timestamp(slot_nr,&UE->frame_parms,DURATION_RX_TO_TX)
+@@ -959,7 +1017,8 @@ void *UE_thread(void *arg) {
+     curMsgTx->tx_wait_for_dlsch = UE->tx_wait_for_dlsch[curMsgTx->proc.nr_slot_tx];
+     UE->tx_wait_for_dlsch[curMsgTx->proc.nr_slot_tx] = 0;
+     pushTpool(&(get_nrUE_params()->Tpool), newElt);
+-
++    LOG_I(PHY,"curMsg.proc.nr_slot_rx: %d\n",curMsg.proc.nr_slot_rx);
++    /*
+     // RX slot processing. We launch and forget.
+     newElt = newNotifiedFIFO_elt(sizeof(nr_rxtx_thread_data_t), curMsg.proc.nr_slot_rx, NULL, UE_dl_processing);
+     nr_rxtx_thread_data_t *curMsgRx = (nr_rxtx_thread_data_t *) NotifiedFifoData(newElt);
+@@ -967,7 +1026,7 @@ void *UE_thread(void *arg) {
+     curMsgRx->UE = UE;
+     curMsgRx->phy_data = UE_dl_preprocessing(UE, &curMsg.proc);
+     pushTpool(&(get_nrUE_params()->Tpool), newElt);
+-
++ 
+     if (curMsg.proc.decoded_frame_rx != -1)
+       decoded_frame_rx=(((mac->mib->systemFrameNumber.buf[0] >> mac->mib->systemFrameNumber.bits_unused)<<4) | curMsg.proc.decoded_frame_rx);
+     else
+@@ -976,7 +1035,7 @@ void *UE_thread(void *arg) {
+     if (decoded_frame_rx>0 && decoded_frame_rx != curMsg.proc.frame_rx)
+       LOG_E(PHY,"Decoded frame index (%d) is not compatible with current context (%d), UE should go back to synch mode\n",
+             decoded_frame_rx, curMsg.proc.frame_rx);
+-
++    */
+     // Wait for TX slot processing to finish
+     notifiedFIFO_elt_t *res;
+     res = pullTpool(&txFifo, &(get_nrUE_params()->Tpool));
+diff --git a/executables/nr-uesoftmodem.c b/executables/nr-uesoftmodem.c
+index 8bf0f6efec..7a0973135c 100644
+--- a/executables/nr-uesoftmodem.c
++++ b/executables/nr-uesoftmodem.c
+@@ -430,11 +430,12 @@ int main( int argc, char **argv ) {
+ 
+   //uint8_t beta_ACK=0,beta_RI=0,beta_CQI=2;
+   PHY_VARS_NR_UE *UE[MAX_NUM_CCs];
+-  start_background_system();
+ 
++  start_background_system();
++ 
+   if ( load_configmodule(argc,argv,CONFIG_ENABLECMDLINEONLY) == NULL) {
+     exit_fun("[SOFTMODEM] Error, configuration module init failed\n");
+-  }
++  } 
+   //set_softmodem_sighandler();
+   CONFIG_SETRTFLAG(CONFIG_NOEXITONHELP);
+   memset(openair0_cfg,0,sizeof(openair0_config_t)*MAX_CARDS);
+diff --git a/openair1/SCHED_NR/fapi_nr_l1.c b/openair1/SCHED_NR/fapi_nr_l1.c
+index 9662780737..47dd90f3ee 100644
+--- a/openair1/SCHED_NR/fapi_nr_l1.c
++++ b/openair1/SCHED_NR/fapi_nr_l1.c
+@@ -154,23 +154,23 @@ void nr_schedule_response(NR_Sched_Rsp_t *Sched_INFO)
+   uint8_t number_ul_dci_pdu         = (UL_dci_req==NULL) ? 0 : UL_dci_req->numPdus;
+   uint8_t number_ul_tti_pdu         = (UL_tti_req==NULL) ? 0 : UL_tti_req->n_pdus;
+   uint8_t number_tx_data_pdu        = (TX_req == NULL) ? 0 : TX_req->Number_of_PDUs;
+-
++  //printf("******number_dl_pdu: %d, slot: %d, frame: %d\n",number_dl_pdu, slot, frame);
+   if (NFAPI_MODE == NFAPI_MONOLITHIC){
+-
++ 
+     if (slot_type == NR_DOWNLINK_SLOT || slot_type == NR_MIXED_SLOT) {
+       notifiedFIFO_elt_t *res=NULL;
+       processingData_L1tx_t *msgTx=NULL;
+-      if (!gNB->reorder_thread_disable) {
++      if (!gNB->reorder_thread_disable) { 
+ 	res = pullTpool(&gNB->L1_tx_free, &gNB->threadPool);
+         if (res == NULL)
+           return; // Tpool has been stopped, nothing to process
+         msgTx = (processingData_L1tx_t *)NotifiedFifoData(res);
+-      } else {
++      } else { 
+         msgTx = gNB->msgDataTx; //newNotifiedFIFO_elt(sizeof(processingData_L1tx_t),0, &gNB->L1_tx_out,NULL);
+       }
+       /*const time_stats_t ts = exec_time_stats_NotifiedFIFO(res);
+       merge_meas(&gNB->phy_proc_tx, &ts);
+-*/
++*/ 
+       msgTx->num_pdsch_slot = 0;
+       msgTx->num_dl_pdcch = 0;
+       msgTx->num_ul_pdcch = number_ul_dci_pdu;
+@@ -184,22 +184,26 @@ void nr_schedule_response(NR_Sched_Rsp_t *Sched_INFO)
+         LOG_D(PHY,"NFAPI: dl_pdu %d : type %d\n",i,dl_tti_pdu->PDUType);
+         switch (dl_tti_pdu->PDUType) {
+           case NFAPI_NR_DL_TTI_SSB_PDU_TYPE:
++	    //printf("NFAPI_NR_DL_TTI_SSB_PDU_TYPE\n");
+             handle_nr_nfapi_ssb_pdu(msgTx,frame,slot,
+                                     dl_tti_pdu);
+             break;
+ 
+           case NFAPI_NR_DL_TTI_PDCCH_PDU_TYPE:
++	    //printf("NFAPI_NR_DL_TTI_PDCCH_PDU_TYPE\n");
+             LOG_D(PHY,"frame %d, slot %d, Got NFAPI_NR_DL_TTI_PDCCH_PDU_TYPE for %d.%d\n",frame,slot,DL_req->SFN,DL_req->Slot);
+             msgTx->pdcch_pdu[msgTx->num_dl_pdcch] = dl_tti_pdu->pdcch_pdu;
+             msgTx->num_dl_pdcch++;
+             break;
+ 
+           case NFAPI_NR_DL_TTI_CSI_RS_PDU_TYPE:
++	    //printf("NFAPI_NR_DL_TTI_CSI_RS_PDU_TYPE\n");
+             LOG_D(PHY,"frame %d, slot %d, Got NFAPI_NR_DL_TTI_CSI_RS_PDU_TYPE for %d.%d\n",frame,slot,DL_req->SFN,DL_req->Slot);
+             handle_nfapi_nr_csirs_pdu(msgTx,frame,slot,&dl_tti_pdu->csi_rs_pdu);
+             break;
+ 
+           case NFAPI_NR_DL_TTI_PDSCH_PDU_TYPE:
++	    //printf("NFAPI_NR_DL_TTI_PDSCH_PDU_TYPE\n");
+             LOG_D(PHY,"frame %d, slot %d, Got NFAPI_NR_DL_TTI_PDSCH_PDU_TYPE for %d.%d\n",frame,slot,DL_req->SFN,DL_req->Slot);
+             nfapi_nr_dl_tti_pdsch_pdu_rel15_t *pdsch_pdu_rel15 = &dl_tti_pdu->pdsch_pdu.pdsch_pdu_rel15;
+             uint16_t pduIndex = pdsch_pdu_rel15->pduIndex;
+diff --git a/openair1/SCHED_NR/nr_ru_procedures.c b/openair1/SCHED_NR/nr_ru_procedures.c
+index 08ed56db8d..208648ac22 100644
+--- a/openair1/SCHED_NR/nr_ru_procedures.c
++++ b/openair1/SCHED_NR/nr_ru_procedures.c
+@@ -171,7 +171,6 @@ void nr_feptx_ofdm(RU_t *ru,int frame_tx,int tti_tx) {
+ }
+ 
+ void nr_feptx_prec(RU_t *ru,int frame_tx,int tti_tx) {
+-
+   int l,aa;
+   PHY_VARS_gNB **gNB_list = ru->gNB_list,*gNB;
+   NR_DL_FRAME_PARMS *fp   = ru->nr_frame_parms;
+@@ -199,7 +198,6 @@ void nr_feptx_prec(RU_t *ru,int frame_tx,int tti_tx) {
+     }
+ 
+     if (ru->nb_tx == 1 && ru->nb_log_antennas == 1) {
+-    
+       VCD_SIGNAL_DUMPER_DUMP_FUNCTION_BY_NAME(VCD_SIGNAL_DUMPER_FUNCTIONS_PHY_PROCEDURES_RU_FEPTX_PREC , 1);
+ 
+       memcpy((void*)ru->common.txdataF_BF[0],
+@@ -327,12 +325,12 @@ void nr_feptx(void *arg) {
+ 
+ // RU FEP TX using thread-pool
+ void nr_feptx_tp(RU_t *ru, int frame_tx, int slot) {
+-
++  //LOG_I(PHY,"111111111111111111, slot: %d\n", slot);
+   nfapi_nr_config_request_scf_t *cfg = &ru->gNB_list[0]->gNB_config;
+   int nbfeptx=0;
+   if (nr_slot_select(cfg,frame_tx,slot) == NR_UPLINK_SLOT) return;
+ //  for (int aa=0; aa<ru->nb_tx; aa++) memset(ru->common.txdataF[aa],0,ru->nr_frame_parms->samples_per_slot_wCP*sizeof(int32_t));
+-
++  //LOG_I(PHY,"11111111111111111122222222222222222\n");
+   if (ru->idx == 0) VCD_SIGNAL_DUMPER_DUMP_FUNCTION_BY_NAME( VCD_SIGNAL_DUMPER_FUNCTIONS_PHY_PROCEDURES_RU_FEPTX_OFDM, 1 );
+   start_meas(&ru->ofdm_total_stats);
+   for (int aid=0;aid<ru->nb_tx;aid++) {
+diff --git a/openair1/SCHED_NR/phy_procedures_nr_gNB.c b/openair1/SCHED_NR/phy_procedures_nr_gNB.c
+index 3b5592753a..15e5db5c08 100644
+--- a/openair1/SCHED_NR/phy_procedures_nr_gNB.c
++++ b/openair1/SCHED_NR/phy_procedures_nr_gNB.c
+@@ -50,6 +50,7 @@
+ uint8_t SSB_Table[38]={0,2,4,6,8,10,12,14,254,254,16,18,20,22,24,26,28,30,254,254,32,34,36,38,40,42,44,46,254,254,48,50,52,54,56,58,60,62};
+ 
+ extern uint8_t nfapi_mode;
++//uint8_t wyj_flag = 0;
+ 
+ void nr_common_signal_procedures (PHY_VARS_gNB *gNB,int frame,int slot,nfapi_nr_dl_tti_ssb_pdu ssb_pdu) {
+ 
+@@ -145,7 +146,7 @@ void phy_procedures_gNB_TX(processingData_L1tx_t *msgTx,
+     {
+       if( (((frame*fp->slots_per_frame + slot) - (prs_config->PRSResourceSetPeriod[1] + prs_config->PRSResourceOffset)+prs_config->PRSResourceSetPeriod[0])%prs_config->PRSResourceSetPeriod[0]) == i*prs_config->PRSResourceTimeGap )
+       {
+-        slot_prs = (slot - i*prs_config->PRSResourceTimeGap + fp->slots_per_frame)%fp->slots_per_frame;
++        slot_prs = (slot - i*prs_config->PRSResourceTimeGap + fp->slots_per_frame)%fp->slots_per_frame; 
+         LOG_D(PHY,"gNB_TX: frame %d, slot %d, slot_prs %d, PRS Resource ID %d\n",frame, slot, slot_prs, rsc_id);
+         nr_generate_prs(gNB->nr_gold_prs[rsc_id][slot_prs],&gNB->common_vars.txdataF[0][txdataF_offset], AMP, prs_config, cfg, fp);
+       }
+@@ -158,14 +159,26 @@ void phy_procedures_gNB_TX(processingData_L1tx_t *msgTx,
+       nr_common_signal_procedures(gNB,frame,slot,msgTx->ssb[i].ssb_pdu);
+       msgTx->ssb[i].active = false;
+     }
+-  }
++  } 
+   
+   VCD_SIGNAL_DUMPER_DUMP_FUNCTION_BY_NAME(VCD_SIGNAL_DUMPER_FUNCTIONS_PHY_PROCEDURES_gNB_COMMON_TX,0);
+ 
+   int num_pdcch_pdus = msgTx->num_ul_pdcch + msgTx->num_dl_pdcch;
+-
+-  if (num_pdcch_pdus > 0) {
+-    LOG_D(PHY, "[gNB %d] Frame %d slot %d Calling nr_generate_dci_top (number of UL/DL PDCCH PDUs %d/%d)\n",
++ 
++  if (num_pdcch_pdus > 0){
++    /*
++    printf("num_pdcch_pdus > 0 at frame %d, slot %d\n", frame, slot);
++    nfapi_nr_dl_tti_pdcch_pdu_rel15_t *wyj_pdcch_pdu = &msgTx->pdcch_pdu[0].pdcch_pdu_rel15;
++    nfapi_nr_dl_dci_pdu_t *wyj_dci_pdu = &wyj_pdcch_pdu->dci_pdu[0];
++    if (msgTx->num_ul_pdcch && wyj_dci_pdu->RNTI==48552 && slot==0){// && wyj_dci_pdu->harq_pid == 0){ //48552:0xBDA8, 4660:0x1234
++      printf("set wyj_flag to 1 at frame %d, slot %d\n", frame, slot);
++      wyj_flag = 1; 
++    }
++    else {
++      wyj_flag = 0;
++    }
++    */
++    LOG_I(PHY, "[gNB %d] Frame %d slot %d Calling nr_generate_dci_top (number of UL/DL PDCCH PDUs %d/%d)\n",
+ 	  gNB->Mod_id, frame, slot, msgTx->num_ul_pdcch, msgTx->num_dl_pdcch);
+   
+     VCD_SIGNAL_DUMPER_DUMP_FUNCTION_BY_NAME(VCD_SIGNAL_DUMPER_FUNCTIONS_PHY_gNB_PDCCH_TX,1);
+diff --git a/openair1/SIMULATION/NR_PHY/dlsim.c b/openair1/SIMULATION/NR_PHY/dlsim.c
+index 1f35072552..c6572b99d1 100644
+--- a/openair1/SIMULATION/NR_PHY/dlsim.c
++++ b/openair1/SIMULATION/NR_PHY/dlsim.c
+@@ -85,7 +85,6 @@ PHY_VARS_gNB *gNB;
+ PHY_VARS_NR_UE *UE;
+ RAN_CONTEXT_t RC;
+ int32_t uplink_frequency_offset[MAX_NUM_CCs][4];
+-
+ double cpuf;
+ char *uecap_file;
+ 
+@@ -1012,8 +1011,9 @@ int main(int argc, char **argv)
+         UE_info->UE_sched_ctrl.harq_processes[harq_pid].ndi = !(trial&1);
+         UE_info->UE_sched_ctrl.harq_processes[harq_pid].round = round;
+ 
+-        // nr_schedule_ue_spec() requires the mutex to be locked
++        // nr_schedule_ue_spec() schedule DCI, requires the mutex to be locked
+         NR_SCHED_LOCK(&gNB_mac->sched_lock);
++	printf("*******************nr_schedule_ue_spec**************, fillin DCI\n");
+         nr_schedule_ue_spec(0, frame, slot, &Sched_INFO->DL_req, &Sched_INFO->TX_req);
+         NR_SCHED_UNLOCK(&gNB_mac->sched_lock);
+         Sched_INFO->module_id = 0;
+@@ -1022,8 +1022,8 @@ int main(int argc, char **argv)
+         Sched_INFO->slot = slot;
+         Sched_INFO->UL_dci_req.numPdus = 0;
+         pushNotifiedFIFO(&gNB->L1_tx_free,msgL1Tx);
+-        nr_schedule_response(Sched_INFO);
+-
++        nr_schedule_response(Sched_INFO); 
++	printf("*******************nr_schedule_response**************, load pdcch to gNB->msgDataTx\n");
+         /* PTRS values for DLSIM calculations   */
+         nfapi_nr_dl_tti_request_body_t *dl_req = &Sched_INFO->DL_req.dl_tti_request_body;
+         nfapi_nr_dl_tti_request_pdu_t  *dl_tti_pdsch_pdu = &dl_req->dl_tti_pdu_list[1];
+@@ -1039,22 +1039,29 @@ int main(int argc, char **argv)
+           ptrsRePerSymb = ((rel15->rbSize + rel15->PTRSFreqDensity - 1)/rel15->PTRSFreqDensity);
+           LOG_D(PHY,"[DLSIM] PTRS Symbols in a slot: %2u, RE per Symbol: %3u, RE in a slot %4d\n", ptrsSymbPerSlot,ptrsRePerSymb, ptrsSymbPerSlot*ptrsRePerSymb );
+         }
+-
++ 
+         msgDataTx->ssb[0].ssb_pdu.ssb_pdu_rel15.bchPayload=0x001234;
+         msgDataTx->ssb[0].ssb_pdu.ssb_pdu_rel15.SsbBlockIndex = 0;
+         msgDataTx->gNB = gNB;
+-        if (run_initial_sync)
++        if (run_initial_sync){
++	  printf("run_initial_sync\n");
+           nr_common_signal_procedures(gNB,frame,slot,msgDataTx->ssb[0].ssb_pdu);
+-        else
++	}else{
++	  printf("not run_initial_sync\n");
+           phy_procedures_gNB_TX(msgDataTx,frame,slot,1);
+-            
+-        int txdataF_offset = slot * frame_parms->samples_per_slot_wCP;
++	}
++	nfapi_nr_dl_tti_pdcch_pdu_rel15_t *wyj_pdcch_pdu = &msgDataTx->pdcch_pdu[0].pdcch_pdu_rel15;
++
++	nfapi_nr_dl_dci_pdu_t *wyj_dci_pdu = &wyj_pdcch_pdu->dci_pdu[0];
++	
++	printf("msgDataTX-dci-rnti:%d\n",wyj_dci_pdu->RNTI);
++        int txdataF_offset = slot * frame_parms->samples_per_slot_wCP; 
+         
+         if (n_trials==1) {
+           LOG_M("txsigF0.m","txsF0=", &gNB->common_vars.txdataF[0][txdataF_offset+2*frame_parms->ofdm_symbol_size],frame_parms->ofdm_symbol_size,1,1);
+           if (gNB->frame_parms.nb_antennas_tx>1)
+             LOG_M("txsigF1.m","txsF1=", &gNB->common_vars.txdataF[1][txdataF_offset+2*frame_parms->ofdm_symbol_size],frame_parms->ofdm_symbol_size,1,1);
+-        }
++        } 
+         int tx_offset = frame_parms->get_samples_slot_timestamp(slot,frame_parms,0);
+         if (n_trials==1) printf("tx_offset %d, txdataF_offset %d \n", tx_offset,txdataF_offset);
+ 
+@@ -1084,11 +1091,13 @@ int main(int argc, char **argv)
+             LOG_M(filename,"txs", &txdata[aa][tx_offset+frame_parms->ofdm_symbol_size+frame_parms->nb_prefix_samples0],6*(frame_parms->ofdm_symbol_size+frame_parms->nb_prefix_samples),1,1);
+           }
+         }
++	printf("length of complex samples: %d\n",frame_length_complex_samples);
+         if (output_fd) {
+           printf("writing txdata to binary file\n");
+           fwrite(txdata[0],sizeof(int32_t),frame_length_complex_samples,output_fd);
+         }
+-
++	//frame_length_complex_samples == 460800 for rnti 48552 usrp experiment
++	printf("*****************************gNB**********************************\n");
+         int txlev[n_tx];
+         int txlev_sum = 0;
+         int l_ofdm = 6;
+@@ -1160,6 +1169,7 @@ int main(int argc, char **argv)
+           }
+         }
+ 
++	printf("****************************UE*************************************\n");
+         nr_ue_dcireq(&dcireq); //to be replaced with function pointer later
+         nr_ue_scheduled_response(&scheduled_response);
+ 
+diff --git a/openair2/LAYER2/MAC/eNB_scheduler_RA.c b/openair2/LAYER2/MAC/eNB_scheduler_RA.c
+index 40eeacfaec..9f55447236 100644
+--- a/openair2/LAYER2/MAC/eNB_scheduler_RA.c
++++ b/openair2/LAYER2/MAC/eNB_scheduler_RA.c
+@@ -1353,8 +1353,9 @@ initiate_ra_proc(module_id_t module_idP,
+       do {
+         if (IS_SOFTMODEM_IQPLAYER) {  /* iq player mode, use deterministic rnti */
+           static int drnti[MAX_MOBILES_PER_ENB];
+-          static int drnti_def[]={ 0xbda7, 0x71da, 0x9c40, 0xc350, 0x2710, 0x4e20, 0x7530, 0x1388, 0x3a98, 0x61a8, 0x88b8, 0xafc8, 0xd6d8, 0x1b58, 0x4268, 0x6978 };
+-          for (int j=0; j<MAX_MOBILES_PER_ENB && j< (sizeof(drnti_def)/sizeof(int));j++)
++          //static int drnti_def[]={ 0xbda7, 0x71da, 0x9c40, 0xc350, 0x2710, 0x4e20, 0x7530, 0x1388, 0x3a98, 0x61a8, 0x88b8, 0xafc8, 0xd6d8, 0x1b58, 0x4268, 0x6978 };
++	  static int drnti_def[]={ 0xbda7, 0xbda7, 0xbda7, 0xbda7, 0xbda7, 0xbda7, 0xbda7, 0xbda7, 0xbda7, 0xbda7, 0xbda7, 0xbda7, 0xbda7, 0xbda7, 0xbda7, 0xbda7 };
++	  for (int j=0; j<MAX_MOBILES_PER_ENB && j< (sizeof(drnti_def)/sizeof(int));j++)
+           	  drnti[i]=drnti_def[i];
+           
+           int nb_ue = 0;
+@@ -1374,7 +1375,8 @@ initiate_ra_proc(module_id_t module_idP,
+ 
+           ra[i].rnti = drnti[nb_ue];
+         } else {
+-          ra[i].rnti = taus();
++          //ra[i].rnti = taus();
++	  ra[i].rnti = 0xbda7;
+         }
+         loop++;
+       } while (loop != 100 &&
+diff --git a/openair2/LAYER2/NR_MAC_COMMON/nr_mac_common.c b/openair2/LAYER2/NR_MAC_COMMON/nr_mac_common.c
+index aa58bac6ca..080ed11325 100644
+--- a/openair2/LAYER2/NR_MAC_COMMON/nr_mac_common.c
++++ b/openair2/LAYER2/NR_MAC_COMMON/nr_mac_common.c
+@@ -3330,10 +3330,12 @@ uint16_t nr_dci_size(const NR_UE_DL_BWP_t *DL_BWP,
+ 
+   switch(format) {
+     case NR_UL_DCI_FORMAT_0_0:
++      LOG_I(NR_MAC, "DCI_FORMAT 0_0 : pdsch_Config %p, pucch_Config %p\n", pdsch_Config, pucch_Config);
+       /// fixed: Format identifier 1, Hop flag 1, MCS 5, NDI 1, RV 2, HARQ PID 4, PUSCH TPC 2 Time Domain assgnmt 4 --20
+       size += 20;
+       dci_pdu->frequency_domain_assignment.nbits = (uint8_t)ceil(log2((N_RB * (N_RB + 1)) >>1)); // Freq domain assignment -- hopping scenario to be updated
+       size += dci_pdu->frequency_domain_assignment.nbits;
++      LOG_I(NR_MAC,"dci_pdu->frequency_domain_assignment.nbits %d (N_RB %d)\n",dci_pdu->frequency_domain_assignment.nbits,N_RB);
+       if(alt_size >= size)
+         size += alt_size - size; // Padding to match 1_0 size
+       else if (ss_type == NR_SearchSpace__searchSpaceType_PR_common) {
+@@ -3344,6 +3346,7 @@ uint16_t nr_dci_size(const NR_UE_DL_BWP_t *DL_BWP,
+       break;
+ 
+     case NR_UL_DCI_FORMAT_0_1:
++      LOG_I(NR_MAC, "DCI_FORMAT 0_1 : pdsch_Config %p, pucch_Config %p\n", pdsch_Config, pucch_Config);
+       /// fixed: Format identifier 1, MCS 5, NDI 1, RV 2, HARQ PID 4, PUSCH TPC 2, ULSCH indicator 1 --16
+       size += 16;
+       // Carrier indicator
+@@ -3381,6 +3384,7 @@ uint16_t nr_dci_size(const NR_UE_DL_BWP_t *DL_BWP,
+         dci_pdu->frequency_domain_assignment.nbits = (int)ceil(log2((N_RB * (N_RB + 1)) >> 1));
+       LOG_D(NR_MAC, "PUSCH Frequency Domain Assignment nbits %d, N_RB %d\n", dci_pdu->frequency_domain_assignment.nbits, N_RB);
+       size += dci_pdu->frequency_domain_assignment.nbits;
++      LOG_I(NR_MAC,"dci_pdu->frequency_domain_assignment.nbits %d (N_RB %d)\n",dci_pdu->frequency_domain_assignment.nbits,N_RB);
+       // Time domain assignment
+       NR_PUSCH_TimeDomainResourceAllocationList_t *tdalistul = get_ul_tdalist(UL_BWP, coreset->controlResourceSetId, ss_type, rnti_type);
+       num_entries = tdalistul ?  tdalistul->list.count : 16; // 16 in default table
+@@ -3480,6 +3484,7 @@ uint16_t nr_dci_size(const NR_UE_DL_BWP_t *DL_BWP,
+       break;
+ 
+     case NR_DL_DCI_FORMAT_1_0:
++      LOG_I(NR_MAC, "DCI_FORMAT 1_0 : pdsch_Config %p, pucch_Config %p\n", pdsch_Config, pucch_Config);
+       /// fixed: Format identifier 1, VRB2PRB 1, MCS 5, NDI 1, RV 2, HARQ PID 4, DAI 2, PUCCH TPC 2, PUCCH RInd 3, PDSCH to HARQ TInd 3 Time Domain assgnmt 4 -- 28
+ 
+       // 3GPP TS 38.212 Section 7.3.1.0: DCI size alignment
+@@ -3488,6 +3493,7 @@ uint16_t nr_dci_size(const NR_UE_DL_BWP_t *DL_BWP,
+       size = 28;
+       dci_pdu->frequency_domain_assignment.nbits = (uint8_t)ceil(log2((N_RB * (N_RB + 1)) >> 1)); // Freq domain assignment
+       size += dci_pdu->frequency_domain_assignment.nbits;
++      LOG_I(NR_MAC,"dci_pdu->frequency_domain_assignment.nbits %d (N_RB %d)\n",dci_pdu->frequency_domain_assignment.nbits,N_RB);
+       if(ss_type == NR_SearchSpace__searchSpaceType_PR_ue_Specific && alt_size >= size)
+         size += alt_size - size; // Padding to match 0_0 size
+       dci_pdu->time_domain_assignment.nbits = 4;
+@@ -3495,7 +3501,7 @@ uint16_t nr_dci_size(const NR_UE_DL_BWP_t *DL_BWP,
+       break;
+ 
+     case NR_DL_DCI_FORMAT_1_1:
+-      LOG_D(NR_MAC, "DCI_FORMAT 1_1 : pdsch_Config %p, pucch_Config %p\n", pdsch_Config, pucch_Config);
++      LOG_I(NR_MAC, "DCI_FORMAT 1_1 : pdsch_Config %p, pucch_Config %p\n", pdsch_Config, pucch_Config);
+       // General note: 0 bits condition is ignored as default nbits is 0.
+       // Format identifier
+       size = 1;
+@@ -3511,6 +3517,7 @@ uint16_t nr_dci_size(const NR_UE_DL_BWP_t *DL_BWP,
+       else
+         dci_pdu->bwp_indicator.nbits = 2;
+       size += dci_pdu->bwp_indicator.nbits;
++      
+       // Freq domain assignment
+       if (pdsch_Config) rbg_size_config = pdsch_Config->rbg_Size;
+       else rbg_size_config = 0;
+@@ -3523,7 +3530,7 @@ uint16_t nr_dci_size(const NR_UE_DL_BWP_t *DL_BWP,
+       else
+          dci_pdu->frequency_domain_assignment.nbits = ((int)ceil(log2((N_RB * (N_RB + 1)) >> 1)) > numRBG) ? (int)ceil(log2((N_RB * (N_RB + 1)) >> 1)) + 1 : numRBG + 1;
+       size += dci_pdu->frequency_domain_assignment.nbits;
+-      LOG_D(NR_MAC,"dci_pdu->frequency_domain_assignment.nbits %d (N_RB %d)\n",dci_pdu->frequency_domain_assignment.nbits,N_RB);
++      LOG_I(NR_MAC,"dci_pdu->frequency_domain_assignment.nbits %d (N_RB %d)\n",dci_pdu->frequency_domain_assignment.nbits,N_RB);
+       NR_PDSCH_TimeDomainResourceAllocationList_t *tdalist = get_dl_tdalist(DL_BWP, coreset->controlResourceSetId, ss_type, rnti_type);
+       num_entries = tdalist ?  tdalist->list.count : 16; // 16 in default table
+       dci_pdu->time_domain_assignment.nbits = (int)ceil(log2(num_entries));
+diff --git a/openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c b/openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c
+index 7326d187a4..46a1bbbbcd 100644
+--- a/openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c
++++ b/openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c
+@@ -441,7 +441,7 @@ int nr_ue_process_dci_indication_pdu(module_id_t module_id,int cc_id, int gNB_in
+   NR_UE_MAC_INST_t *mac = get_mac_inst(module_id);
+   dci_pdu_rel15_t *def_dci_pdu_rel15 = &mac->def_dci_pdu_rel15[slot][dci->dci_format];
+ 
+-  LOG_D(MAC,"Received dci indication (rnti %x,dci format %d,n_CCE %d,payloadSize %d,payload %llx)\n",
++  LOG_I(MAC,"Received dci indication (rnti %x,dci format %d,n_CCE %d,payloadSize %d,payload %llx)\n",
+ 	dci->rnti,dci->dci_format,dci->n_CCE,dci->payloadSize,*(unsigned long long*)dci->payloadBits);
+   int8_t ret = nr_extract_dci_info(mac, dci->dci_format, dci->payloadSize, dci->rnti, dci->ss_type, (uint64_t *)dci->payloadBits, def_dci_pdu_rel15, slot);
+   if ((ret&1) == 1) return -1;
+diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_RA.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_RA.c
+index fb78ff0d13..25d91fc62d 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_RA.c
++++ b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_RA.c
+@@ -153,7 +153,7 @@ static int16_t ssb_index_from_prach(module_id_t module_idP,
+ 
+   return index;
+ }
+-
++ 
+ //Compute Total active SSBs and RO available
+ void find_SSB_and_RO_available(gNB_MAC_INST *nrmac)
+ {
+@@ -651,17 +651,21 @@ void nr_initiate_ra_proc(module_id_t module_idP,
+ 
+     int loop = 0;
+     if (ra->rnti == 0) { // This condition allows for the usage of a preconfigured rnti for the CFRA
+-      do {
++      ra->rnti = 0xbda7;
++      do { 
+         // 3GPP TS 38.321 version 15.13.0 Section 7.1 Table 7.1-1: RNTI values
+-        ra->rnti = (taus() % 0xffef) + 1;
+-        loop++;
+-      } while (loop != 100
+-               && !((find_nr_UE(&nr_mac->UE_info, ra->rnti) == NULL) && (find_nr_RA_id(module_idP, CC_id, ra->rnti) == -1)
+-                    && ra->rnti >= 0x1 && ra->rnti <= 0xffef));
++        //ra->rnti = (taus() % 0xffef) + 1;
++	ra->rnti = (ra->rnti%0xffef) + 1;
++	loop++; 
++      } while (loop != 100 
++	       && !((find_nr_UE(&nr_mac->UE_info, ra->rnti) == NULL) && (find_nr_RA_id(module_idP, CC_id, ra->rnti) == -1) 
++		                && ra->rnti >= 0x1 && ra->rnti <= 0xffef));
++      
+       if (loop == 100) {
+         LOG_E(NR_MAC, "%s:%d:%s: [RAPROC] initialisation random access aborted\n", __FILE__, __LINE__, __FUNCTION__);
+         abort();
+-      }
++      } 
++      
+     }
+ 
+     ra->RA_rnti = ra_rnti;
+diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c
+index 4d3d59c12e..cabc8949c9 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c
++++ b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c
+@@ -894,12 +894,12 @@ void nr_schedule_ue_spec(module_id_t module_id,
+   NR_UEs_t *UE_info = &gNB_mac->UE_info;
+   nfapi_nr_dl_tti_request_body_t *dl_req = &DL_req->dl_tti_request_body;
+ 
+-  UE_iterator(UE_info->list, UE) {
++  UE_iterator(UE_info->list, UE) { 
+     NR_UE_sched_ctrl_t *sched_ctrl = &UE->UE_sched_ctrl;
+     NR_UE_DL_BWP_t *current_BWP = &UE->current_DL_BWP;
+ 
+     if (sched_ctrl->ul_failure==1 && get_softmodem_params()->phy_test==0) continue;
+-
++ 
+     NR_sched_pdsch_t *sched_pdsch = &sched_ctrl->sched_pdsch;
+     UE->mac_stats.dl.current_bytes = 0;
+     UE->mac_stats.dl.current_rbs = 0;
+@@ -977,7 +977,7 @@ void nr_schedule_ue_spec(module_id_t module_id,
+           pucch->ul_slot,
+           sched_pdsch->pucch_allocation,
+           sched_ctrl->tpc1);
+-
++ 
+     const int bwp_id = current_BWP->bwp_id;
+     const int coresetid = sched_ctrl->coreset->controlResourceSetId;
+ 
+@@ -985,7 +985,7 @@ void nr_schedule_ue_spec(module_id_t module_id,
+     nfapi_nr_dl_tti_pdcch_pdu_rel15_t *pdcch_pdu = gNB_mac->pdcch_pdu_idx[CC_id][coresetid];
+ 
+     if (!pdcch_pdu) {
+-      LOG_D(NR_MAC, "creating pdcch pdu, pdcch_pdu = NULL. \n");
++      LOG_I(NR_MAC, "creating pdcch pdu, pdcch_pdu = NULL. \n");
+       nfapi_nr_dl_tti_request_pdu_t *dl_tti_pdcch_pdu = &dl_req->dl_tti_pdu_list[dl_req->nPDUs];
+       memset(dl_tti_pdcch_pdu, 0, sizeof(nfapi_nr_dl_tti_request_pdu_t));
+       dl_tti_pdcch_pdu->PDUType = NFAPI_NR_DL_TTI_PDCCH_PDU_TYPE;
+@@ -1097,7 +1097,7 @@ void nr_schedule_ue_spec(module_id_t module_id,
+     pdcch_pdu->numDlDci++;
+     dci_pdu->RNTI = rnti;
+ 
+-    if (sched_ctrl->coreset &&
++    if (sched_ctrl->coreset && 
+         sched_ctrl->search_space &&
+         sched_ctrl->coreset->pdcch_DMRS_ScramblingID &&
+         sched_ctrl->search_space->searchSpaceType->present == NR_SearchSpace__searchSpaceType_PR_ue_Specific) {
+@@ -1154,9 +1154,10 @@ void nr_schedule_ue_spec(module_id_t module_id,
+           dci_payload.ndi,
+           dci_payload.rv,
+           dci_payload.tpc,
+-          pucch->timing_indicator);
+-
++          pucch->timing_indicator); 
++ 
+     const int rnti_type = NR_RNTI_C;
++    LOG_D(NR_MAC,">>>set dci_pdu->RNTI to: %d, frame: %d, slot:%d \n", rnti, frame, slot);
+     fill_dci_pdu_rel15(scc,
+                        cg,
+                        current_BWP,
+@@ -1169,7 +1170,8 @@ void nr_schedule_ue_spec(module_id_t module_id,
+                        sched_ctrl->search_space,
+                        sched_ctrl->coreset,
+                        gNB_mac->cset0_bwp_size);
+-
++    LOG_D(NR_MAC,"<<<set dci_pdu->RNTI to: %d, frame: %d, slot:%d \n", rnti, frame, slot);
++ 
+     LOG_D(NR_MAC,
+           "coreset params: FreqDomainResource %llx, start_symbol %d  n_symb %d\n",
+           (unsigned long long)pdcch_pdu->FreqDomainResource,
+diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_primitives.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_primitives.c
+index 33bd6831d1..10bb8d33b9 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_primitives.c
++++ b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_primitives.c
+@@ -59,10 +59,11 @@
+ 
+ #include "common/ran_context.h"
+ 
+-//#define DEBUG_DCI
++#define DEBUG_DCI1
+ 
+ extern RAN_CONTEXT_t RC;
+ 
++uint8_t cnt = 0;
+ // CQI TABLES (10 times the value in 214 to adequately compare with R)
+ // Table 1 (38.214 5.2.2.1-2)
+ static const uint16_t cqi_table1[16][2] = {{0, 0},
+@@ -1253,7 +1254,7 @@ void fill_dci_pdu_rel15(const NR_ServingCellConfigCommon_t *scc,
+       // indicating a DL DCI format 1bit
+       pos++;
+       *dci_pdu |= ((uint64_t)1) << (dci_size - pos);
+-      LOG_D(NR_MAC,
++      LOG_I(NR_MAC,
+             "DCI1_0 (size %d): Format indicator %d (%d bits) N_RB_BWP %d => %d (0x%lx)\n",
+             dci_size,
+             dci_pdu_rel15->format_indicator,
+@@ -1265,7 +1266,7 @@ void fill_dci_pdu_rel15(const NR_ServingCellConfigCommon_t *scc,
+       fsize = (int)ceil(log2((N_RB * (N_RB + 1)) >> 1));
+       pos += fsize;
+       *dci_pdu |= (((uint64_t)dci_pdu_rel15->frequency_domain_assignment.val & ((1 << fsize) - 1)) << (dci_size - pos));
+-      LOG_D(NR_MAC,
++      LOG_I(NR_MAC,
+             "Freq domain assignment %d (%d bits)=> %d (0x%lx)\n",
+             dci_pdu_rel15->frequency_domain_assignment.val,
+             fsize,
+@@ -1295,7 +1296,7 @@ void fill_dci_pdu_rel15(const NR_ServingCellConfigCommon_t *scc,
+         // Time domain assignment 4bit
+         pos += 4;
+         *dci_pdu |= ((dci_pdu_rel15->time_domain_assignment.val & 0xf) << (dci_size - pos));
+-        LOG_D(NR_MAC,
++        LOG_I(NR_MAC,
+               "Time domain assignment %d (%d bits)=> %d (0x%lx)\n",
+               dci_pdu_rel15->time_domain_assignment.val,
+               4,
+@@ -1346,6 +1347,7 @@ void fill_dci_pdu_rel15(const NR_ServingCellConfigCommon_t *scc,
+         // PDSCH-to-HARQ_feedback timing indicator 3bit
+         pos += 3;
+         *dci_pdu |= ((dci_pdu_rel15->pdsch_to_harq_feedback_timing_indicator.val & 0x7) << (dci_size - pos));
++	LOG_I(NR_MAC, "DCI has %d bits and the payload is %lx\n", dci_size, *dci_pdu);
+         LOG_D(NR_MAC,
+               "PDSCH to HARQ TI %d (%d bits)=> %d (0x%lx)\n",
+               dci_pdu_rel15->pdsch_to_harq_feedback_timing_indicator.val,
+@@ -1573,7 +1575,7 @@ void fill_dci_pdu_rel15(const NR_ServingCellConfigCommon_t *scc,
+   case NR_UL_DCI_FORMAT_0_1:
+     switch (rnti_type) {
+     case NR_RNTI_C:
+-      LOG_D(NR_MAC,"Filling NR_UL_DCI_FORMAT_0_1 size %d format indicator %d\n",dci_size,dci_pdu_rel15->format_indicator);
++      LOG_I(NR_MAC,"Filling NR_UL_DCI_FORMAT_0_1 size %d format indicator %d\n",dci_size,dci_pdu_rel15->format_indicator);
+       // Indicating a DL DCI format 1bit
+       pos = 1;
+       *dci_pdu |= ((uint64_t)dci_pdu_rel15->format_indicator & 0x1) << (dci_size - pos);
+@@ -1615,10 +1617,16 @@ void fill_dci_pdu_rel15(const NR_ServingCellConfigCommon_t *scc,
+       *dci_pdu |= ((uint64_t)dci_pdu_rel15->dai[1].val & ((1 << dci_pdu_rel15->dai[1].nbits) - 1)) << (dci_size - pos);
+       // TPC command for scheduled PUSCH  2bit
+       pos += 2;
+-      *dci_pdu |= ((uint64_t)dci_pdu_rel15->tpc & 0x3) << (dci_size - pos);
++      // wyj:change TPC
++      uint64_t tmpTPC = (uint64_t)dci_pdu_rel15->tpc;
++      if ( cnt%5 == 0){
++	tmpTPC = 0;
++      }
++      *dci_pdu |= (tmpTPC & 0x3) << (dci_size - pos);
++      //*dci_pdu |= ((uint64_t)dci_pdu_rel15->tpc & 0x3) << (dci_size - pos);
+       // SRS resource indicator
+       pos += dci_pdu_rel15->srs_resource_indicator.nbits;
+-      *dci_pdu |= ((uint64_t)dci_pdu_rel15->srs_resource_indicator.val & ((1 << dci_pdu_rel15->srs_resource_indicator.nbits) - 1)) << (dci_size - pos);
++      *dci_pdu |= ((uint64_t)dci_pdu_rel15->srs_resource_indicator.val & ((1 << dci_pdu_rel15->srs_resource_indicator.nbits) - 1)) << (dci_size - pos);  
+       // Precoding info and n. of layers
+       pos += dci_pdu_rel15->precoding_information.nbits;
+       *dci_pdu |= ((uint64_t)dci_pdu_rel15->precoding_information.val & ((1 << dci_pdu_rel15->precoding_information.nbits) - 1)) << (dci_size - pos);
+@@ -1647,7 +1655,7 @@ void fill_dci_pdu_rel15(const NR_ServingCellConfigCommon_t *scc,
+       pos += 1;
+       *dci_pdu |= ((uint64_t)dci_pdu_rel15->ulsch_indicator & 0x1) << (dci_size - pos);
+ 
+-#ifdef DEBUG_DCI
++#ifdef DEBUG_DCI1
+         LOG_I(NR_MAC,"============= NR_UL_DCI_FORMAT_0_1 =============\n");
+         LOG_I(NR_MAC,"dci_size = %i\n", dci_size);
+         LOG_I(NR_MAC,"dci_pdu_rel15->format_indicator = %i\n", dci_pdu_rel15->format_indicator);
+@@ -1663,7 +1671,7 @@ void fill_dci_pdu_rel15(const NR_ServingCellConfigCommon_t *scc,
+         LOG_I(NR_MAC,"dci_pdu_rel15->harq_pid = %i\n", dci_pdu_rel15->harq_pid);
+         LOG_I(NR_MAC,"dci_pdu_rel15->dai[0].val = %i\n", dci_pdu_rel15->dai[0].val);
+         LOG_I(NR_MAC,"dci_pdu_rel15->dai[1].val = %i\n", dci_pdu_rel15->dai[1].val);
+-        LOG_I(NR_MAC,"dci_pdu_rel15->tpc = %i\n", dci_pdu_rel15->tpc);
++        LOG_I(NR_MAC,"dci_pdu_rel15->tpc = %i\n", tmpTPC); 
+         LOG_I(NR_MAC,"dci_pdu_rel15->srs_resource_indicator.val = %i\n", dci_pdu_rel15->srs_resource_indicator.val);
+         LOG_I(NR_MAC,"dci_pdu_rel15->precoding_information.val = %i\n", dci_pdu_rel15->precoding_information.val);
+         LOG_I(NR_MAC,"dci_pdu_rel15->antenna_ports.val = %i\n", dci_pdu_rel15->antenna_ports.val);
+@@ -1676,6 +1684,7 @@ void fill_dci_pdu_rel15(const NR_ServingCellConfigCommon_t *scc,
+         LOG_I(NR_MAC,"dci_pdu_rel15->ulsch_indicator = %i\n", dci_pdu_rel15->ulsch_indicator);
+ #endif
+ 
++	LOG_I(NR_MAC, "DCI has %d bits and the payload is %lx\n", dci_size, *dci_pdu);
+         break;
+     }
+     break;
+diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c
+index 80c1652b61..2488b44d8a 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c
++++ b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c
+@@ -36,7 +36,7 @@
+ #include <openair2/UTIL/OPT/opt.h>
+ #include "LAYER2/NR_MAC_COMMON/nr_mac_extern.h"
+ #include "LAYER2/nr_rlc/nr_rlc_oai_api.h"
+-
++uint8_t wyj_flag = 0;
+ //#define SRS_IND_DEBUG
+ 
+ const int get_ul_tda(gNB_MAC_INST *nrmac, const NR_ServingCellConfigCommon_t *scc, int frame, int slot)
+@@ -313,7 +313,7 @@ static int nr_process_mac_pdu(instance_t module_idP,
+             uint8_t *next_subpduP = pduP + mac_subheader_len + mac_len;
+             if ((pduP[mac_subheader_len+mac_len] & 0x3F) == UL_SCH_LCID_C_RNTI) {
+               crnti = ((next_subpduP[1]&0xFF)<<8)|(next_subpduP[2]&0xFF);
+-              LOG_W(NR_MAC, " UL_SCH_LCID_SRB for rnti %04x\n", crnti);
++              LOG_I(NR_MAC, " UL_SCH_LCID_SRB for rnti %04x\n", crnti);
+               UE_idx = find_nr_UE(&RC.nrmac[module_idP]->UE_info, crnti);
+               break;
+             }
+@@ -2351,7 +2351,7 @@ void nr_schedule_ulsch(module_id_t module_id, frame_t frame, sub_frame_t slot, n
+         ss->searchSpaceType->present == NR_SearchSpace__searchSpaceType_PR_ue_Specific) {
+       dci_pdu->ScramblingId = *coreset->pdcch_DMRS_ScramblingID;
+       dci_pdu->ScramblingRNTI = rnti;
+-    } else {
++    } else { 
+       dci_pdu->ScramblingId = *scc->physCellId;
+       dci_pdu->ScramblingRNTI = 0;
+     }
+@@ -2372,7 +2372,8 @@ void nr_schedule_ulsch(module_id_t module_id, frame_t frame, sub_frame_t slot, n
+                  UE->UE_sched_ctrl.tpc0,
+                  cur_harq->ndi,
+                  current_BWP);
+-
++    LOG_I(NR_MAC,">>>set dci_pdu->RNTI to: %d, frame: %d, slot:%d \n", rnti, frame, slot);
++    wyj_flag = 1;
+     fill_dci_pdu_rel15(scc,
+                        cg,
+                        &UE->current_DL_BWP,
+@@ -2385,7 +2386,7 @@ void nr_schedule_ulsch(module_id_t module_id, frame_t frame, sub_frame_t slot, n
+                        ss,
+                        coreset,
+                        nr_mac->cset0_bwp_size);
+-
++    LOG_I(NR_MAC,"<<<set dci_pdu->RNTI to: %d, frame: %d, slot:%d \n", rnti, frame, slot);
+     memset(sched_pusch, 0, sizeof(*sched_pusch));
+   }
+ }
+diff --git a/radio/USRP/USERSPACE/LIB/usrp_lib.cpp b/radio/USRP/USERSPACE/LIB/usrp_lib.cpp
+index 8053411516..3bd43272b3 100644
+--- a/radio/USRP/USERSPACE/LIB/usrp_lib.cpp
++++ b/radio/USRP/USERSPACE/LIB/usrp_lib.cpp
+@@ -398,6 +398,8 @@ static int trx_usrp_write(openair0_device *device,
+ 			  int nsamps,
+ 			  int cc,
+ 			  int flags) {
++
++  //printf("trx_usrp_write nsamps:%d, flags:%d\n",nsamps,flags);
+   int ret=0;
+   usrp_state_t *s = (usrp_state_t *)device->priv;
+   int nsamps2;  // aligned to upper 32 or 16 byte boundary
+@@ -510,7 +512,7 @@ VCD_SIGNAL_DUMPER_DUMP_FUNCTION_BY_NAME(VCD_SIGNAL_DUMPER_FUNCTIONS_BEAM_SWITCHI
+       write_thread->end = write_thread->start;
+       write_thread->count_write = 0;
+     }
+-
++  
+     end = write_thread->end;
+     write_package[end].timestamp    = timestamp;
+     write_package[end].nsamps       = nsamps;
+diff --git a/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf b/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf
+index 7d5d49fe87..1654e77671 100644
+--- a/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf
++++ b/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf
+@@ -11,7 +11,8 @@ gNBs =
+ 
+     // Tracking area code, 0x0000 and 0xfffe are reserved values
+     tracking_area_code  =  1;
+-    plmn_list = ({ mcc = 001; mnc = 01; mnc_length = 2; snssaiList = ({ sst = 1; }) });
++    plmn_list = ({ mcc = 001; mnc = 01; mnc_length = 2; snssaiList = ({ sst = 1; 
++}) });
+ 
+     nr_cellid = 12345678L;
+ 
+@@ -206,7 +207,7 @@ RUs = (
+   local_rf       = "yes"
+   nb_tx          = 1
+   nb_rx          = 1
+-  att_tx         = 12;
++  att_tx         = 14;
+   att_rx         = 12;
+   bands          = [78];
+   max_pdschReferenceSignalPower = -27;
